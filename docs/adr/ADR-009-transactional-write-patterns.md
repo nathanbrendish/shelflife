@@ -173,6 +173,14 @@ Continue treating partial-write risk as an accepted limitation.
 
 ---
 
+## Deferred Follow-ups (Phase 2)
+
+**FUP-2 — `merge_community_foods` full-transaction RPC:** `mergeCommunityFoods` still reassigns and consolidates aliases and votes through separate PostgREST calls in `src/app/actions/community-intelligence.ts:326-352`. A failure between calls can leave a partially-applied merge. Phase 2 must introduce one authorization-checked transactional RPC covering alias consolidation, vote reassignment, aggregate refresh, source locking, and moderation history. This is the direct Phase-2 sibling of the Phase 1 transactional-write work; it is also tracked in the [product roadmap Known Technical Debt register](../product-roadmap.md#known-technical-debt).
+
+Related Phase-2 items—BUG-10 AI rate-limiting/usage metering and the safe error-contract consistency sweep—are tracked in the same [roadmap debt register](../product-roadmap.md#known-technical-debt). The latter implements [Rules #5](#rules) across residual single-write paths.
+
+---
+
 ## Cross References
 
 - [ADR-003: Server Actions](./ADR-003-server-actions.md)

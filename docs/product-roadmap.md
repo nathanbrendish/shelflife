@@ -267,6 +267,9 @@
 | HEIC image support depends on browser/OS native decoding | Technical debt |
 | `public.pantry_items` legacy table exists on Production only (unreferenced by the app) | Technical debt — requires a separate, explicitly reviewed removal migration |
 | Migration `012_reconcile_production_schema.sql` requires its FK-referenced tables to exist at execution time; this is a drifted-history limitation, not a clean-replay failure (`supabase db reset` 001→014 succeeds and is verified by CI) | Technical debt — see [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md) |
+| **FUP-2:** `mergeCommunityFoods` alias consolidation and vote reassignment still use separate PostgREST writes, with partial-commit risk | Deferred-tracked (Phase 2) — implement a full-transaction `merge_community_foods` RPC; see [ADR-009 Deferred Follow-ups](./adr/ADR-009-transactional-write-patterns.md#deferred-follow-ups-phase-2) |
+| **BUG-10:** AI rate-limiting and usage metering are not implemented. [`withGeminiRetry()`](./api-reference.md#retry-logic) provides retry/backoff for transient provider limits but does not enforce per-user quotas or meter usage | Deferred-tracked (Phase 2) — author ADR-010 at Phase-2 kickoff; no ADR-010 currently exists |
+| **Error-contract consistency sweep:** taxonomy CRUD, `saveMeal`, `toggle*`/`clear*`, and `addIngredient` can still expose inconsistent or raw backend errors | Deferred-tracked (Phase 2) — information-disclosure/UX risk with no data-integrity impact; apply [ADR-009 Rules #5](./adr/ADR-009-transactional-write-patterns.md#rules) |
 
 ---
 
