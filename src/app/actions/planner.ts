@@ -91,8 +91,6 @@ export async function getCurrentMealPlan(): Promise<{
 export async function generateMealPlan(
   daysCount: 3 | 5 | 7
 ): Promise<GeneratePlanResult> {
-  console.log("[generateMealPlan] started", { daysCount });
-
   try {
     const { supabase, user } = await getAuthenticatedUser();
 
@@ -108,10 +106,6 @@ export async function generateMealPlan(
         error: "Unable to load your pantry. Please try again.",
       };
     }
-
-    console.log("[generateMealPlan] pantry loaded", {
-      ingredientCount: pantry?.length ?? 0,
-    });
 
     const apiKey = process.env.GEMINI_API_KEY;
 
@@ -136,18 +130,11 @@ export async function generateMealPlan(
       expiry_date: item.expiry_date as string | null,
     }));
 
-    console.log("[generateMealPlan] requesting Gemini meal plan");
-
     const meals = await withPlannerGeminiRetry(async () => {
       const result = await model.generateContent(
         buildMealPlanRequest(daysCount, pantryItems)
       );
       const responseText = result.response.text();
-
-      console.log("[generateMealPlan] Gemini response received", {
-        hasText: Boolean(responseText),
-        length: responseText?.length ?? 0,
-      });
 
       if (!responseText) {
         throw new Error("Gemini returned an empty meal plan response.");
@@ -162,40 +149,7 @@ export async function generateMealPlan(
       return parsed;
     });
 
-    console.log("[generateMealPlan] parsed meals", {
-      count: meals.length,
-      names: meals.map((meal) => meal.name),
-    });
-
-    const { data: existingPlans } = await supabase
-      .from("meal_plans")
-      .select("id")
-      .eq("user_id", user.id);
-
-    if (existingPlans && existingPlans.length > 0) {
-      await supabase.from("meal_plans").delete().eq("user_id", user.id);
-    }
-
-    const { data: plan, error: planError } = await supabase
-      .from("meal_plans")
-      .insert({
-        user_id: user.id,
-        days_count: daysCount,
-      })
-      .select("id")
-      .single();
-
-    if (planError || !plan) {
-      console.error("[generateMealPlan] plan insert failed:", planError);
-      return {
-        success: false,
-        error: planError?.message ?? "Failed to save your meal plan.",
-      };
-    }
-
     const items = meals.map((meal, index) => ({
-      plan_id: plan.id,
-      user_id: user.id,
       day_index: meal.dayIndex,
       sort_order: index,
       meal_name: meal.name,
@@ -204,16 +158,21 @@ export async function generateMealPlan(
       missing_ingredients: meal.missingIngredients,
     }));
 
-    const { error: itemsError } = await supabase
-      .from("meal_plan_items")
-      .insert(items);
+    // Single transaction: delete the old plan and insert the new plan + all
+    // its items atomically (ADR-009 Task 3). A failed item insert now rolls
+    // back the delete too, so the user is never left planless.
+    const { data: planId, error: replaceError } = await supabase.rpc(
+      "replace_meal_plan",
+      { p_days_count: daysCount, p_items: items }
+    );
 
-    if (itemsError) {
-      console.error("[generateMealPlan] items insert failed:", itemsError);
-      return { success: false, error: itemsError.message };
+    if (replaceError || !planId) {
+      console.error("[generateMealPlan] replace_meal_plan RPC failed:", replaceError);
+      return {
+        success: false,
+        error: "Failed to save your meal plan. Please try again.",
+      };
     }
-
-    console.log("[generateMealPlan] plan saved", { planId: plan.id });
 
     try {
       await triggerShoppingListRegeneration();
@@ -228,11 +187,7 @@ export async function generateMealPlan(
     revalidatePath("/dashboard");
     revalidatePath("/shopping");
 
-    console.log("[generateMealPlan] completed successfully", {
-      planId: plan.id,
-    });
-
-    return { success: true, planId: plan.id };
+    return { success: true, planId };
   } catch (error) {
     console.error("[generateMealPlan] failed:", error);
 
@@ -252,18 +207,18 @@ export async function generateMealPlan(
 export async function reorderMealPlanItems(
   orderedIds: string[]
 ): Promise<PlannerActionResult> {
-  const { supabase, user } = await getAuthenticatedUser();
+  const { supabase } = await getAuthenticatedUser();
 
-  for (let index = 0; index < orderedIds.length; index++) {
-    const { error } = await supabase
-      .from("meal_plan_items")
-      .update({ sort_order: index })
-      .eq("id", orderedIds[index])
-      .eq("user_id", user.id);
+  // Single transaction: apply every sort_order update in one statement
+  // (ADR-009 Task 4) instead of N sequential PostgREST requests, so a
+  // mid-sequence failure can no longer leave a partially reordered plan.
+  const { error } = await supabase.rpc("reorder_meal_plan_items", {
+    p_ordered_ids: orderedIds,
+  });
 
-    if (error) {
-      return { success: false, error: error.message };
-    }
+  if (error) {
+    console.error("[reorderMealPlanItems] reorder_meal_plan_items RPC failed:", error);
+    return { success: false, error: "Failed to reorder meals. Please try again." };
   }
 
   try {

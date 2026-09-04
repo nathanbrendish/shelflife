@@ -367,19 +367,34 @@ test("shopping rows persist quantity-aware demand details", () => {
 });
 
 test("shopping insertions use one shared persistence path", () => {
+  // Recipe "Add Missing Items" is a simple append and still goes through the
+  // shared insert helper.
   assert.match(shoppingPersistence, /export async function insertShoppingListRows/);
   assert.match(shoppingPersistence, /\.from\("shopping_list_items"\)/);
-  assert.match(shoppingAction, /insertShoppingListRows/);
   assert.match(shoppingListAction, /insertShoppingListRows/);
-  assert.doesNotMatch(
-    shoppingAction,
-    /\.from\("shopping_list_items"\)[\s\S]{0,120}\.insert\(/,
-    "weekly regeneration should not bypass shared insertion helper"
-  );
   assert.doesNotMatch(
     shoppingListAction,
     /\.from\("shopping_list_items"\)[\s\S]{0,120}\.insert\(/,
     "recipe Add Missing should not bypass shared insertion helper"
+  );
+
+  // Weekly regeneration is a delete-then-insert and must be one atomic
+  // transaction (ADR-009 Task 1 / BUG-01), so it goes through the
+  // `regenerate_shopping_list` RPC instead of the plain insert helper — never
+  // a raw, non-transactional delete/insert pair. Scoped to
+  // regenerateShoppingList's own body: clearCheckedItems/clearShoppingList
+  // are legitimate single-write actions that do delete directly.
+  const regenerateBody = exportedFunctionBody(shoppingAction, "regenerateShoppingList");
+  assert.match(regenerateBody, /\.rpc\(\s*"regenerate_shopping_list"/);
+  assert.doesNotMatch(
+    regenerateBody,
+    /\.from\("shopping_list_items"\)[\s\S]{0,200}\.insert\(/,
+    "weekly regeneration should persist through the atomic RPC, not a raw insert"
+  );
+  assert.doesNotMatch(
+    regenerateBody,
+    /\.from\("shopping_list_items"\)\s*\.delete\(\)/,
+    "weekly regeneration should not delete outside the atomic RPC"
   );
 });
 
@@ -387,9 +402,16 @@ test("cooking completion uses canonical pantry consumption engine", () => {
   const completeBody = exportedFunctionBody(mealsAction, "completeCookedMeal");
   const cookBody = exportedFunctionBody(mealsAction, "cookMeal");
 
-  assert.match(completeBody, /consumePantryForCookedMeal/);
+  // Matching/deduction computation still lives exclusively in
+  // pantry-consumption.ts; completeCookedMeal only plans there, then
+  // persists the whole result (pantry deductions + observations) in one
+  // transaction via the complete_cooked_meal RPC (ADR-009 Task 5 / BUG-03),
+  // never through direct, non-transactional pantry writes.
+  assert.match(completeBody, /planCookedMealConsumption/);
+  assert.match(completeBody, /\.rpc\(\s*"complete_cooked_meal"/);
   assert.match(completeBody, /triggerShoppingListRegeneration/);
   assert.doesNotMatch(completeBody, /\.from\("pantry"\)\s*[\s\S]*\.delete\(\)/);
+  assert.doesNotMatch(completeBody, /\.from\("pantry"\)\s*[\s\S]*\.update\(/);
   assert.match(cookBody, /completeCookedMeal/);
   assert.match(pantryConsumption, /foodsMatch/);
   assert.match(pantryConsumption, /unitsAreCompatible/);

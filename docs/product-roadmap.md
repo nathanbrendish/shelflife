@@ -197,7 +197,7 @@
 
 - ✅ `CookingConfirmationModal` — per-ingredient quantity adjustment before pantry deduction
 - ✅ `completeCookedMeal()` server action — canonical cooking completion
-- ✅ `consumePantryForCookedMeal()` — canonical pantry consumption with per-ingredient deduction
+- ✅ `planCookedMealConsumption()` — canonical pantry consumption with per-ingredient deduction (persisted atomically via the `complete_cooked_meal` RPC, ADR-009)
 - ✅ `cooking_behavior_observations` table — anonymous cooking learning (recipe vs actual usage)
 - ✅ `cookMeal()` is now a compatibility wrapper for `completeCookedMeal()`
 - ✅ Shopping list recalculated immediately after cooking completion
@@ -266,7 +266,7 @@
 | Personal storage location learning (user habit vs community default) not implemented | Planned (v2.1) |
 | HEIC image support depends on browser/OS native decoding | Technical debt |
 | `public.pantry_items` legacy table exists on Production only (unreferenced by the app) | Technical debt — requires a separate, explicitly reviewed removal migration |
-| Migration `012_reconcile_production_schema.sql` cannot succeed on a from-scratch database replay (accepted, documented limitation) | Technical debt |
+| Migration `012_reconcile_production_schema.sql` requires its FK-referenced tables to exist at execution time; this is a drifted-history limitation, not a clean-replay failure (`supabase db reset` 001→014 succeeds and is verified by CI) | Technical debt — see [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md) |
 
 ---
 

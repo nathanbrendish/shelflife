@@ -1,0 +1,121 @@
+name: CI
+
+# Phase 0 safety net (Technical Debt Assessment / ADR-009).
+# Two independent gates:
+#   1. quality      — lint, strict typecheck, unit tests, production build
+#                     (P0-1)
+#   2. migrations   — clean `supabase db reset` (001 -> latest) on real
+#                     Supabase local stack (P0-2), immediately followed by the
+#                     fault-injection suite (P0-3) against that freshly-reset
+#                     database. The reset step is the PERMANENT ARBITER for
+#                     the migration-012 clean-replay question (see ADR-008
+#                     addendum, 13 Jul 2026) and for all bootstrap / DR
+#                     claims; the fault-injection step is the permanent proof
+#                     that every ADR-009 RPC is actually atomic, not just
+#                     written to look atomic.
+#
+# NOTE: migration 001 declares an FK to auth.users, so the chain can only be
+# validated against the Supabase local stack (which provides the `auth` schema
+# and the anon/authenticated/service_role roles) — a bare Postgres container
+# cannot replay these migrations.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, Typecheck, Test, Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck (strict, no emit)
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        # Public Supabase vars are read when the SSR/client helpers are
+        # constructed. Dummy values are sufficient for `next build`; no real
+        # secret is needed because no network call happens at build time.
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://example.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: dummy-anon-key-for-build-only
+          NEXT_PUBLIC_SITE_URL: http://localhost:3000
+        run: npm run build
+
+  migrations:
+    name: Migration Chain + Fault Injection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Supabase CLI
+        # Pinned (L-1), not `latest`: an unpinned CLI/postgres-image bump could
+        # change the `auth.users` schema or reset behaviour and break this job
+        # with no code change on our side. Bump deliberately, re-verify a clean
+        # `db reset` locally, and update this pin in the same PR.
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.109.1
+
+      - name: Start Supabase local stack (database only)
+        # Every non-`db` container is excluded (verified locally: a migration
+        # replay against a fresh `db`-only stack applies 001->015 identically
+        # to a full stack, since GoTrue/PostgREST/etc. consume the `auth`/
+        # `storage` schemas the postgres image ships with rather than
+        # creating them — they add nothing the migration chain needs).
+        # Minimises image pulls and removes the most common CI flake sources
+        # (analytics/logflare/vector/imgproxy) entirely.
+        run: >-
+          supabase start
+          -x gotrue -x kong -x postgrest -x realtime -x storage-api
+          -x studio -x postgres-meta -x edge-runtime -x logflare
+          -x vector -x imgproxy -x mailpit -x supavisor
+
+      - name: Clean replay of all migrations (the arbiter)
+        # `db reset` drops the local database and replays every migration in
+        # supabase/migrations in filename order from empty. A non-zero exit
+        # means the chain cannot bootstrap a fresh database — fail the build.
+        run: supabase db reset
+
+      - name: Fault-injection tests (ADR-009 Phase 0 P0-3 + Phase 1 DoD)
+        # Proves atomicity for real, against the freshly-reset database: each
+        # test forces a later write in a formerly multi-step sequence to fail
+        # and asserts the whole transaction rolled back (Tasks 1, 2, 3, 5, 6).
+        env:
+          SUPABASE_DB_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: npm run test:fault-injection
+
+      - name: Report
+        run: echo "Migration chain 001 -> latest replayed cleanly on an empty database, and all fault-injection tests passed."

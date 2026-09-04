@@ -166,6 +166,18 @@ Instead:
 
 ---
 
+## Addendum — 13 July 2026: Migration 012 Replay Correction
+
+The body above is retained as the original incident and decision record, but its claim that migration 012 cannot succeed on a clean, from-scratch replay is incorrect.
+
+Migration 012 fails only when its FK-referenced tables are absent at execution time — under drifted or partially-applied migration history, as in the July 2026 Production incident where migrations 004–011 were recorded as applied but their objects were missing. It does not fail on a clean, ordered replay: migrations 004/005/007 create those prerequisites before 012 runs. A from-scratch `supabase db reset` (001→014) succeeds.
+
+The original claim generalized an assumption from the Production drift incident and was never empirically tested; Development had reached its state through manual pre-application, not a clean replay. This is itself an instance of this ADR's central lesson: migration history and prose are not proof. The migration-chain CI job introduced under [ADR-009](./ADR-009-transactional-write-patterns.md) now performs the clean reset on every PR and is the permanent arbiter for bootstrap and disaster-recovery claims.
+
+Migration 014 remains unchanged as an immutable deployed artifact. Its comment is retained as historical evidence; this addendum and [database-schema.md § 11](../database-schema.md#11-production-schema-reconciliation-july-2026) are the corrected living record.
+
+---
+
 ## Cross References
 
 - [docs/database-schema.md § 11 — Production Schema Reconciliation](../database-schema.md#11-production-schema-reconciliation-july-2026)
@@ -173,3 +185,4 @@ Instead:
 - [docs/release-notes.md § 6 — Production Schema Reconciliation](../release-notes.md#6-production-schema-reconciliation)
 - [docs/developer-onboarding.md — Database Migrations](../developer-onboarding.md#11-database-migrations)
 - [ADR-002: Supabase](./ADR-002-supabase.md)
+- [ADR-009: Transactional Write Patterns](./ADR-009-transactional-write-patterns.md)

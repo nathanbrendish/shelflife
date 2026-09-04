@@ -22,6 +22,7 @@ All dates and commit references are derived from the git log. Version numbers re
    - 4.4 [Quantity-Aware Shopping and Cooking Confirmation](#44-quantity-aware-shopping-and-cooking-confirmation)
 5. [Post-v2.0 Fixes](#5-post-v20-fixes)
 6. [Production Schema Reconciliation](#6-production-schema-reconciliation)
+7. [ADR-009 Phase 0 and Phase 1](#7-adr-009-phase-0-and-phase-1)
 
 ---
 
@@ -577,15 +578,30 @@ A second forensic audit, run after deployment, confirmed Development and Product
 ### Known Limitations
 
 - `public.pantry_items` remains on Production. It is not dropped in this release because a `DROP TABLE` is not an additive operation and this table may hold real historical rows; its removal is deferred to a separate, explicitly reviewed migration.
-- Migration 012 cannot succeed on a brand-new, from-scratch replay of migration history (001 → 014) against an empty database — it will still fail at the same missing-prerequisite error, because a migration runner aborts the whole batch at the first failure and 013/014 never get a chance to run first. This does not affect Development or Production, both of which reached their current state through the one-time manual pre-application described above rather than a from-scratch replay. It is an accepted, permanent, disclosed limitation.
+- ~~Migration 012 cannot succeed on a brand-new, from-scratch replay...~~ **Retracted 13 July 2026.** Empirically verified false via the migration-chain CI job introduced under ADR-009: a clean `supabase db reset` applies 001→014 with zero failures, because migrations 004/005/007 create every prerequisite 012 references before it runs. The original Production failure was specific to that environment's drifted migration ledger (004–011 recorded as applied without running), not a general property of a from-scratch replay. See [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md) for the corrected record.
 
 ### Future Work
 
 - A dedicated migration to `DROP TABLE public.pantry_items` after explicit human review confirming no real user data is at risk.
-- A dedicated schema-cleanup migration (015 or later) to drop the deprecated free-text columns (`pantry.category`, `pantry.subcategory`, `community_foods.primary_category`/`secondary_category`, `community_food_votes.category`), now that both environments are confirmed to have converged on the same deprecated-but-present state.
+- A dedicated schema-cleanup migration (016 or later) to drop the deprecated free-text columns (`pantry.category`, `pantry.subcategory`, `community_foods.primary_category`/`secondary_category`, `community_food_votes.category`), now that both environments are confirmed to have converged on the same deprecated-but-present state.
 - Consider adding an automated, scheduled forensic schema comparison between Development and Production (rather than only running one manually at release time) to detect drift closer to when it happens.
 
 **Full technical detail:** [docs/database-schema.md § 11](./database-schema.md#11-production-schema-reconciliation-july-2026), [docs/architecture.md § 19.6](./architecture.md#196-production-schema-reconciliation-july-2026), [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md).
+
+---
+
+## 7. ADR-009 Phase 0 and Phase 1
+
+**Date:** 13 July 2026
+**Type:** Data-integrity and CI hardening
+
+Migration 015 adds six authenticated, `SECURITY DEFINER` transactional write RPCs for shopping-list regeneration (`regenerate_shopping_list`), meal-plan replacement (`replace_meal_plan`), meal-plan reordering (`reorder_meal_plan_items`), cooking completion (`complete_cooked_meal`), receipt-batch persistence (`save_scanned_items`), and community-food moderation (`moderate_community_food`). The corresponding Server Actions in `shopping.ts`, `planner.ts`, `meals.ts`, `receipt.ts`, and `community-intelligence.ts` were rewritten to compute their payloads in TypeScript and persist them through these RPCs, so each operation now commits all dependent writes together or rolls them all back. This supersedes the previously accepted partial-write trade-off in [ADR-006](./adr/ADR-006-shopping-persistence.md).
+
+The receipt RPC also adds a database-enforced stacking identity (`pantry_user_canonical_stack_idx`) that includes the raw unit. On conflict, quantities are summed rather than overwritten (FUP-1, complete), and empty-string units are normalized to `NULL` at the RPC boundary. The remaining compatible-but-different raw-unit race (BUG-05) can produce separate rows without losing quantity and is tracked for Phase 2 in [database-schema.md § 10](./database-schema.md#10-future-schema-improvements).
+
+Alongside the RPCs, the single-write `deleteIngredient` action was hardened to the ADR-009 error-contract rule (BUG-11): it now uses a counted delete, returns a safe `PantryFormState` (surfacing "not found" and failure inline via the new `DeleteIngredientButton` client component) instead of returning `void`, and only regenerates the shopping list once a row is confirmed removed.
+
+Phase 0 adds the repository CI workflow (`.github/workflows/ci.yml`), a clean migration-chain reset (`supabase db reset`, 001→latest), and a deterministic Supabase seed (`supabase/seed.sql`). Local environment variables are documented in [developer-onboarding.md § 6](./developer-onboarding.md#6-environment-variables) (the repository does not commit an `.env` template — `.env*` is git-ignored). Integration fault-injection tests (`tests-integration/fault-injection.test.mjs`, `npm run test:fault-injection`) verify transaction rollback and stacking-conflict behavior. See [ADR-009](./adr/ADR-009-transactional-write-patterns.md) and [database-schema.md § 5.6](./database-schema.md#56-transactional-write-boundaries).
 
 ---
 
@@ -607,3 +623,4 @@ A second forensic audit, run after deployment, confirmed Development and Product
 | 012 | `pantry` reconciliation on Production (category/subcategory + storage/classification cache columns) — see Section 6 |
 | 013 | Comprehensive additive Dev↔Prod schema reconciliation (10 tables, 16 columns, 15 functions, 1 trigger, 13 indexes) — see Section 6 |
 | 014 | Defensive hardening of migration 012's prerequisite dependency — see Section 6 |
+| 015 | ADR-009 transactional write RPCs, atomic receipt stacking, and `pantry_user_canonical_stack_idx` — see Section 7 |

@@ -8,7 +8,8 @@ import {
   resolveCommunityFood,
 } from "@/lib/community-foods";
 import {
-  insertOrStackPantryItem,
+  planScannedItemsStack,
+  type ExistingPantryRow,
   type PantryUpsertRow,
 } from "@/lib/pantry-stacking";
 import { createClient } from "@/lib/supabase/server";
@@ -143,26 +144,50 @@ export async function saveScannedIngredients(
 
   const { supabase, user } = await getAuthenticatedUser();
 
-  let added = 0;
-  let duplicates = 0;
-
-  // Sequential so identical items in one batch stack onto each other instead
-  // of racing to insert separate rows.
+  // Enrichment (community learning + classification lookups) stays
+  // sequential per item so identical items in one batch resolve consistently,
+  // but nothing is written to `pantry` yet — the whole batch is planned
+  // against a single pantry read, then persisted in one transaction.
+  const enriched: PantryUpsertRow[] = [];
   for (const item of selected) {
-    const row = await enrichScannedItem(supabase, user.id, item);
-    const result = await insertOrStackPantryItem(supabase, row);
-
-    if (result.status === "error") {
-      return { success: false, error: result.error };
-    }
-    if (result.status === "stacked") {
-      duplicates++;
-    } else {
-      added++;
-    }
+    enriched.push(await enrichScannedItem(supabase, user.id, item));
   }
 
-  await triggerShoppingListRegeneration();
+  const { data: existingRows, error: pantryError } = await supabase
+    .from("pantry")
+    .select("id, quantity, unit, ingredient_name, canonical_food_id, expiry_date, storage_location_id")
+    .eq("user_id", user.id);
+
+  if (pantryError) {
+    console.error("[saveScannedIngredients] pantry read failed:", pantryError);
+    return { success: false, error: "Unable to save ingredients. Please try again." };
+  }
+
+  const { rows, added, duplicates } = planScannedItemsStack(
+    (existingRows ?? []) as ExistingPantryRow[],
+    enriched
+  );
+
+  const { error: saveError } = await supabase.rpc("save_scanned_items", {
+    items: rows,
+  });
+
+  if (saveError) {
+    console.error("[saveScannedIngredients] save_scanned_items RPC failed:", saveError);
+    return { success: false, error: "Unable to save ingredients. Please try again." };
+  }
+
+  // The import is already committed at this point (save_scanned_items
+  // succeeded), so a regen failure must not reject the action (M-2) — that
+  // would tell the user their receipt import failed when it actually saved.
+  try {
+    await triggerShoppingListRegeneration();
+  } catch (regenError) {
+    console.error(
+      "[saveScannedIngredients] shopping regen failed (non-fatal):",
+      regenError
+    );
+  }
 
   revalidatePath("/pantry");
   revalidatePath("/dashboard");

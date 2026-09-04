@@ -37,6 +37,7 @@ ShelfLife uses Next.js 16 Server Actions as the primary mutation layer. There is
 
 **Architecture principles:**
 - All Server Actions re-authenticate via `supabase.auth.getUser()` before any operation
+- Dependent multi-write operations persist through transactional PostgreSQL RPCs defined by ADR-009
 - Mutations call `revalidatePath()` to invalidate the Next.js route cache
 - Pantry and planner mutations trigger `triggerShoppingListRegeneration()` to keep the shopping list current
 - Community learning is non-blocking — failures resolve to an empty cache snapshot, never blocking the primary write
@@ -135,6 +136,21 @@ revalidatePath("/dashboard");
 ```
 
 `triggerShoppingListRegeneration()` is defined in `shopping.ts` and internally calls `regenerateShoppingList()`, then revalidates `/shopping` and `/dashboard`. This means all pantry and planner mutating actions revalidate the shopping list as a side effect.
+
+### 3.4 Transactional Write RPCs
+
+Migration `015_transactional_write_rpcs.sql` implements the [ADR-009](./adr/ADR-009-transactional-write-patterns.md) persistence boundary. TypeScript computes payloads; these authenticated `SECURITY DEFINER` RPCs apply dependent writes atomically.
+
+| RPC | Called by | Atomic guarantee |
+|---|---|---|
+| `regenerate_shopping_list(rows jsonb)` | `regenerateShoppingList` | Shopping-list replacement cannot commit its delete without its inserts |
+| `replace_meal_plan(p_days_count integer, p_items jsonb)` | `generateMealPlan` | Plan header and items replace the prior plan together |
+| `reorder_meal_plan_items(p_ordered_ids jsonb)` | `reorderMealPlanItems` | All sort positions update in one statement |
+| `complete_cooked_meal(p_deductions jsonb, p_observations jsonb)` | `completeCookedMeal` | Pantry deductions and cooking observations commit together |
+| `save_scanned_items(items jsonb)` | `saveScannedIngredients` | The complete receipt batch commits or rolls back together |
+| `moderate_community_food(p_action, p_food_id, p_before, p_after, p_target_food_id)` | Community moderation actions | Food mutation and audit-history insertion commit together |
+
+All functions derive the user from `auth.uid()`; `moderate_community_food` additionally requires `is_super_admin()`. Shopping regeneration after cooking or receipt import is a separate derived-data refresh and is intentionally non-fatal after the primary transactional RPC succeeds.
 
 ---
 
@@ -505,18 +521,21 @@ async function classifyPantryFood(
 ### `deleteIngredient`
 
 ```typescript
-async function deleteIngredient(formData: FormData): Promise<void>
+async function deleteIngredient(
+  _prevState: PantryFormState,
+  formData: FormData
+): Promise<PantryFormState>
 ```
 
-**Type:** Form Action  
+**Type:** Form Action (for `useActionState`)  
 **Authentication:** Required  
 **FormData:** `id` (UUID)
 
-Deletes the pantry row scoped to `user_id`. Triggers shopping list regeneration. Revalidates `/pantry`, `/dashboard`, `/meals`.
+Deletes the pantry row scoped to `user_id` using a counted delete (`{ count: "exact" }`). Returns a safe result contract instead of throwing: `{ error }` if the delete fails or matched no row (`count === 0`), `null` on success (ADR-009 Task 7 / BUG-11). Only regenerates the shopping list once a row is confirmed deleted, then revalidates `/pantry`, `/dashboard`, `/meals`.
 
-**Tables Written:** `pantry` (DELETE)  
+**Tables Written:** `pantry` (DELETE, counted)  
 **Revalidation:** `/pantry`, `/dashboard`, `/meals`  
-**Shared Components Using It:** `PantryBrowser`, `PantryEditModal`
+**Shared Components Using It:** `DeleteIngredientButton` (`delete-ingredient-button.tsx`), which wraps the action in `useActionState` to surface a failed delete inline
 
 ---
 
@@ -539,13 +558,13 @@ async function regenerateShoppingList(): Promise<ShoppingListResult>
 3. `computeShoppingList()` — semantic demand aggregation minus pantry supply
 4. `collectManualItemsToPreserve()` — keep manual items not in pantry and not in computed set
 5. Preserve `checked` state from existing rows
-6. **DELETE all user shopping rows**
-7. `insertShoppingListRows()` — reinsert computed (source: `meal_plan`) + preserved manual (source: `manual`)
-8. Return `{ items, summary }`
+6. Build the final row set (computed `meal_plan` rows + preserved `manual` rows)
+7. Call the `regenerate_shopping_list(rows jsonb)` RPC, which **deletes all of the user's rows and inserts the new set in one transaction** (ADR-009 Task 2 / BUG-01)
+8. Map the returned rows and return `{ items, summary }`
 
-**Tables Written:** `shopping_list_items` (DELETE then INSERT)  
+**Tables Written:** `shopping_list_items` (atomic DELETE-all + INSERT via `regenerate_shopping_list` RPC)  
 **Tables Read:** `meal_plans`, `meal_plan_items`, `pantry`, `shopping_list_items`, `food_subcategories`, RPC `resolve_community_foods`  
-**Note:** Delete-and-reinsert is not atomic. A concurrent Add Missing action during regeneration could lose its rows. Accepted at current scale.
+**Atomicity:** The delete and insert commit or roll back together, so an insert failure can no longer leave the user with a permanently empty shopping list. On RPC failure the action logs the raw error and throws a generic, user-safe message. See [§3.4](#34-transactional-write-rpcs).
 
 ---
 
@@ -748,11 +767,12 @@ type CookingUsageInput = {
 
 **Processing:**
 1. Normalises and filters ingredient inputs
-2. Calls `consumePantryForCookedMeal()` — FIFO quantity deduction + observation recording
-3. Calls `triggerShoppingListRegeneration()`
-4. Revalidates: `/pantry`, `/dashboard`, `/meals`, `/planner`, `/shopping`, `/recipes`, `/saved-meals`
+2. Calls `planCookedMealConsumption()` — computes the pantry deductions (FIFO by expiry) and observation rows **in memory, no writes**
+3. Calls the `complete_cooked_meal(p_deductions, p_observations)` RPC — applies the deductions (UPDATE/DELETE) and inserts the observations in **one transaction** (ADR-009 Task 5 / BUG-03)
+4. Calls `triggerShoppingListRegeneration()` — non-fatal: the pantry write is already committed and the RPC is not idempotent, so a regen failure is logged, not reported as a failed cook (avoids a retry that would double-deduct)
+5. Revalidates: `/pantry`, `/dashboard`, `/meals`, `/planner`, `/shopping`, `/recipes`, `/saved-meals`
 
-**Tables Written:** `pantry` (UPDATE quantity or DELETE rows), `cooking_behavior_observations` (INSERT)  
+**Tables Written:** `pantry` (UPDATE quantity or DELETE rows) + `cooking_behavior_observations` (INSERT), committed together via `complete_cooked_meal`  
 **Shared Components Using It:** `CookingConfirmationModal`
 
 ---
@@ -834,15 +854,13 @@ async function generateMealPlan(daysCount: 3 | 5 | 7): Promise<GeneratePlanResul
 1. Fetches pantry (`ingredient_name`, `expiry_date`)
 2. Calls Gemini with `MEAL_PLAN_PROMPT` + pantry list + `daysCount`
 3. Parses via `parseMealPlanResponse(responseText, daysCount)`
-4. Deletes all existing meal plans for the user
-5. Inserts new `meal_plans` row + `meal_plan_items` rows
-6. Calls `triggerShoppingListRegeneration()` (non-fatal if fails)
-7. Revalidates `/planner`, `/dashboard`, `/shopping`
+4. Calls the `replace_meal_plan(p_days_count, p_items)` RPC — deletes the old plan and inserts the new `meal_plans` row + all `meal_plan_items` in **one transaction** (ADR-009 Task 3 / BUG-02), returning the new plan id
+5. Calls `triggerShoppingListRegeneration()` (non-fatal if it fails)
+6. Revalidates `/planner`, `/dashboard`, `/shopping`
 
-**Tables Written:** `meal_plans` (DELETE + INSERT), `meal_plan_items` (INSERT)  
+**Tables Written:** `meal_plans` (DELETE + INSERT) and `meal_plan_items` (INSERT), committed together via `replace_meal_plan`  
 **Retry:** `withPlannerGeminiRetry()` — retry logic specific to planner  
-**Error handling:** `mapGeminiError(error, "planner")`  
-**Note:** Contains `console.log` debug statements throughout (known technical debt)
+**Error handling:** `mapGeminiError(error, "planner")`
 
 ---
 
@@ -853,9 +871,9 @@ async function reorderMealPlanItems(orderedIds: string[]): Promise<PlannerAction
 ```
 
 **Authentication:** Required  
-Updates `sort_order` (not `day_index`) for each item to reflect the user's drag-and-drop order. Calls `triggerShoppingListRegeneration()` (non-fatal if fails). Revalidates `/planner`, `/dashboard`.
+Updates `sort_order` (not `day_index`) for each item to reflect the user's drag-and-drop order. Applies every position in a single statement via the `reorder_meal_plan_items(p_ordered_ids)` RPC (ADR-009 Task 4 / BUG-14), so a mid-sequence failure can no longer leave a partially reordered plan. Calls `triggerShoppingListRegeneration()` (non-fatal if fails). Revalidates `/planner`, `/dashboard`.
 
-**Tables Written:** `meal_plan_items` (UPDATE `sort_order` only)
+**Tables Written:** `meal_plan_items` (UPDATE `sort_order` only, via `reorder_meal_plan_items`)
 
 ---
 
@@ -901,20 +919,16 @@ type SaveScannedIngredientsResult =
 
 **Authentication:** Required
 
-**Processing (sequential — not parallel):**
+**Processing:**
 
-Sequential processing is intentional: if the same item appears twice in the batch (e.g. two Milk entries from one receipt), they must stack onto each other rather than race to insert separate rows.
-
-For each ingredient:
-1. `enrichScannedItem()` — records community observation, resolves classification, returns `PantryUpsertRow`
-2. `insertOrStackPantryItem()` — stacks or inserts
-
-After all ingredients:
-3. `triggerShoppingListRegeneration()`
-4. Revalidates: `/pantry`, `/dashboard`, `/meals`, `/planner`, `/shopping`
+1. `enrichScannedItem()` runs **sequentially** per item (records community observation, resolves classification, returns a `PantryUpsertRow`). Enrichment stays sequential so identical items in one batch resolve consistently — but nothing is written to `pantry` yet.
+2. Reads the user's pantry once, then `planScannedItemsStack()` (pure, in `pantry-stacking.ts`) plans the whole batch against that single snapshot: each planned row carries an `id` to update an existing row, or `null` to insert.
+3. Calls the `save_scanned_items(items jsonb)` RPC — applies the entire batch (updates + inserts) in **one transaction** (ADR-009 Task 6 / BUG-07), so a mid-batch failure imports nothing. The insert path uses `ON CONFLICT` on `pantry_user_canonical_stack_idx` to sum quantities when a matching identity raced in concurrently.
+4. `triggerShoppingListRegeneration()` — non-fatal: the import is already committed, so a regen failure must not report the import as failed (M-2).
+5. Revalidates: `/pantry`, `/dashboard`, `/meals`, `/planner`, `/shopping`
 
 **Returns:** count of `added` (new rows), `duplicates` (stacked), `scanned` (total attempted)  
-**Tables Written:** `pantry`, community tables (via RPC)  
+**Tables Written:** `pantry` (batch via `save_scanned_items`), community tables (via the enrichment RPCs)  
 **Shared Components Using It:** `ReceiptIngredientReview` (via `ReceiptScanner`)
 
 ---
@@ -1040,6 +1054,8 @@ Calls `supabase.rpc("delete_user_account")` — a SECURITY DEFINER function that
 
 **File:** `src/app/actions/community-intelligence.ts`  
 **Authentication:** All functions require `SUPER_ADMIN` role via `requireSuperAdmin()`
+
+**Moderation persistence:** `approveCommunityFood`, `rejectCommunityFood`, `lockCommunityFoodEntry`, `editCommunityFood`, and `mergeCommunityFoods` all persist through the `moderate_community_food` RPC ([§3.4](#34-transactional-write-rpcs)). It applies the `community_foods` change and the `community_food_moderation_history` audit insert in **one transaction** and re-asserts `is_super_admin()` internally (ADR-009 Task 1 / BUG-04). `requireSuperAdmin()` remains the page-access / read guard.
 
 ### `getCommunityIntelligenceDashboardData`
 
@@ -1231,19 +1247,19 @@ The single point of INSERT for `pantry`. Used by `addIngredient` (pantry.ts) and
 
 ---
 
-### 15.4 `consumePantryForCookedMeal` (Pantry Consumption)
+### 15.4 `planCookedMealConsumption` (Pantry Consumption Planning)
 
 **File:** `src/lib/pantry-consumption.ts`  
 **Type:** Server-only (`import "server-only"`)
 
 ```typescript
-async function consumePantryForCookedMeal(
+async function planCookedMealConsumption(
   supabase: ConsumptionClient,
   input: CompleteCookingInput
-): Promise<void>
+): Promise<{ deductions: PantryDeduction[]; observations: CookingObservationRow[] }>
 ```
 
-The single canonical pantry consumption implementation. FIFO deduction by `expiry_date`, semantic food matching via `foodsMatch()`, unit compatibility via `unitsAreCompatible()`, anonymous observation recording. Called only by `completeCookedMeal()`.
+The single canonical pantry consumption implementation. Reads the pantry once and computes — **in memory, with no writes** — which rows to deduct (FIFO by `expiry_date`, semantic matching via `foodsMatch()`, unit compatibility via `unitsAreCompatible()`) and the anonymous observation rows. Each deduction carries `action: "update" | "delete"` and the target remaining quantity. Called only by `completeCookedMeal()`, which passes the returned plan to the `complete_cooked_meal` RPC for atomic persistence (ADR-009 Task 5). Renamed from the earlier `consumePantryForCookedMeal()`, which both computed *and* wrote.
 
 ---
 
@@ -1283,7 +1299,7 @@ function matchesAnyPantry(
 ): boolean
 ```
 
-The semantic matching primitive. Three-tier resolution (canonical ID → substitutable family → string fallback). Used in: `computeShoppingList`, `pantrySupplyForRequirement`, `collectManualItemsToPreserve`, `matchRecipeToPantry`, `rankRecipes`, `expiryBonus`, `consumePantryForCookedMeal`, `addMissingIngredientsToShoppingList`.
+The semantic matching primitive. Three-tier resolution (canonical ID → substitutable family → string fallback). Used in: `computeShoppingList`, `pantrySupplyForRequirement`, `collectManualItemsToPreserve`, `matchRecipeToPantry`, `rankRecipes`, `expiryBonus`, `planCookedMealConsumption`, `addMissingIngredientsToShoppingList`.
 
 ---
 
@@ -1328,7 +1344,7 @@ Actions return typed error objects; they do not throw to the client. The UI read
 | Database error | Returns `{ success: false, error: error.message }` |
 | Gemini error | Returns `{ status: "error", message }` via `mapGeminiError()` |
 | Community learning failure | Non-blocking — continues with empty cache snapshot |
-| Shopping regeneration failure | Non-fatal in planner/receipt contexts — logged as warning |
+| Shopping regeneration failure | Non-fatal in planner / receipt / cooking contexts (the primary transactional RPC already committed) — logged, not surfaced as a failure |
 
 ### 16.2 Gemini Error Mapping
 
@@ -1355,9 +1371,11 @@ Client Component
   │   └── triggerShoppingListRegeneration() → shopping.ts
   │
   ├── receipt.ts
-  │   ├── enrichScannedItem() → community-foods.ts → Supabase RPC
-  │   ├── insertOrStackPantryItem() → pantry-stacking.ts
-  │   └── triggerShoppingListRegeneration() → shopping.ts
+  │   ├── enrichScannedItem() → community-foods.ts → Supabase RPC (sequential)
+  │   ├── pantry SELECT (single snapshot)
+  │   ├── planScannedItemsStack() → pantry-stacking.ts (pure)
+  │   ├── save_scanned_items(items) RPC → pantry (atomic batch)
+  │   └── triggerShoppingListRegeneration() → shopping.ts (non-fatal)
   │
   ├── shopping.ts
   │   ├── regenerateShoppingList()
@@ -1367,8 +1385,7 @@ Client Component
   │   │   ├── buildFoodResolver() → food-resolver.ts → RPC
   │   │   ├── computeShoppingList() → shopping-list.ts (pure)
   │   │   ├── collectManualItemsToPreserve() (pure)
-  │   │   ├── shopping_list_items DELETE
-  │   │   └── insertShoppingListRows() → shopping-list-persistence.ts
+  │   │   └── regenerate_shopping_list(rows) RPC → shopping_list_items DELETE-all + INSERT (atomic)
   │   ├── getShoppingList() → shopping_list_items SELECT only
   │   ├── toggleShoppingItem() → shopping_list_items UPDATE
   │   ├── clearCheckedItems() → shopping_list_items DELETE (checked)
@@ -1390,11 +1407,12 @@ Client Component
   │   │   ├── buildFoodResolver() + rankRecipes() (pure)
   │   │   └── Gemini API call
   │   ├── completeCookedMeal()
-  │   │   ├── consumePantryForCookedMeal() → pantry-consumption.ts
-  │   │   │   ├── pantry SELECT + UPDATE/DELETE
-  │   │   │   ├── buildFoodResolver() → RPC
-  │   │   │   └── cooking_behavior_observations INSERT
-  │   │   └── triggerShoppingListRegeneration() → shopping.ts
+  │   │   ├── planCookedMealConsumption() → pantry-consumption.ts (plan only, no writes)
+  │   │   │   ├── pantry SELECT
+  │   │   │   └── buildFoodResolver() → RPC
+  │   │   ├── complete_cooked_meal(deductions, observations) RPC
+  │   │   │   → pantry UPDATE/DELETE + cooking_behavior_observations INSERT (atomic)
+  │   │   └── triggerShoppingListRegeneration() → shopping.ts (non-fatal)
   │   ├── saveMeal() → meals_saved INSERT
   │   └── removeSavedMeal() → meals_saved DELETE
   │
@@ -1402,12 +1420,12 @@ Client Component
   │   ├── generateMealPlan()
   │   │   ├── pantry SELECT
   │   │   ├── Gemini API call
-  │   │   ├── meal_plans DELETE + INSERT
-  │   │   ├── meal_plan_items INSERT
-  │   │   └── triggerShoppingListRegeneration() → shopping.ts
+  │   │   ├── replace_meal_plan(days_count, items) RPC
+  │   │   │   → meal_plans DELETE + INSERT, meal_plan_items INSERT (atomic)
+  │   │   └── triggerShoppingListRegeneration() → shopping.ts (non-fatal)
   │   ├── reorderMealPlanItems()
-  │   │   ├── meal_plan_items UPDATE
-  │   │   └── triggerShoppingListRegeneration() → shopping.ts
+  │   │   ├── reorder_meal_plan_items(ordered_ids) RPC → meal_plan_items UPDATE (single statement)
+  │   │   └── triggerShoppingListRegeneration() → shopping.ts (non-fatal)
   │   └── replaceMealPlanItem()
   │       ├── Gemini API call
   │       ├── meal_plan_items UPDATE
@@ -1421,8 +1439,10 @@ Client Component
   ├── settings.ts → Supabase Auth updateUser / rpc delete_user_account
   │
   └── community-intelligence.ts (SUPER_ADMIN only)
-      └── community_foods, food_categories, food_subcategories,
-          storage_locations, community_food_moderation_history SELECT/INSERT/UPDATE
+      ├── moderation actions → moderate_community_food() RPC
+      │   → community_foods UPDATE + community_food_moderation_history INSERT (atomic)
+      └── taxonomy CRUD → food_categories, food_subcategories,
+          storage_locations SELECT/INSERT/UPDATE
 
 REST API
   └── /api/scan-receipt

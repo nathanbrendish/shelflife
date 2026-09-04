@@ -1,0 +1,10 @@
+-- Supabase seed file, run after migrations during `supabase db reset`.
+-- Referenced by supabase/config.toml ([db.seed] sql_paths = ["./seed.sql"]).
+--
+-- Intentionally empty: all reference/lookup data (food categories,
+-- subcategories, storage locations, platform roles) is seeded by the
+-- migrations themselves (005, 006), so a from-scratch reset already produces
+-- a complete, working schema with no extra seed data required.
+--
+-- Add local-only development fixtures below if needed. Do NOT add anything
+-- that production migrations depend on — migrations must remain self-contained.

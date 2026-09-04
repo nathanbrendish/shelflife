@@ -30,7 +30,27 @@ type PantryRow = {
   unit: string | null;
 };
 
-function observationAction(item: CookingUsageInput) {
+export type PantryDeduction = {
+  id: string;
+  new_quantity: number;
+  action: "update" | "delete";
+};
+
+export type CookingObservationRow = {
+  recipe_id: string | null;
+  recipe_name: string;
+  expected_ingredient: string | null;
+  actual_ingredient: string;
+  expected_quantity: number | null;
+  expected_unit: string | null;
+  actual_quantity: number;
+  actual_unit: string | null;
+  action: "used" | "skipped" | "extra" | "substituted";
+};
+
+function observationAction(
+  item: CookingUsageInput
+): CookingObservationRow["action"] {
   if (item.actualQuantity <= 0) return "skipped";
   if (!item.expectedIngredient) return "extra";
   if (
@@ -42,12 +62,18 @@ function observationAction(item: CookingUsageInput) {
   return "used";
 }
 
-async function deductIngredientFromPantry(
-  supabase: ConsumptionClient,
-  userId: string,
+/**
+ * Plans (but does not write) the pantry deductions for one ingredient against
+ * an in-memory snapshot of the user's pantry, mutating `pantryRows` so later
+ * ingredients in the same batch see the effect of earlier ones. Matching
+ * logic (which rows this ingredient consumes, in what order, by how much)
+ * lives entirely here; the caller persists the resulting plan atomically.
+ */
+function planIngredientDeduction(
   pantryRows: PantryRow[],
   ingredient: CookingUsageInput,
-  resolver: Awaited<ReturnType<typeof buildFoodResolver>>
+  resolver: Awaited<ReturnType<typeof buildFoodResolver>>,
+  deductions: Map<string, PantryDeduction>
 ) {
   let remaining = ingredient.actualQuantity;
   if (remaining <= 0) {
@@ -70,40 +96,36 @@ async function deductIngredientFromPantry(
     const consumed = Math.min(currentQuantity, remaining);
     const nextQuantity = currentQuantity - consumed;
     remaining -= consumed;
+    row.quantity = nextQuantity;
 
-    if (nextQuantity <= 0) {
-      const { error } = await supabase
-        .from("pantry")
-        .delete()
-        .eq("id", row.id)
-        .eq("user_id", userId);
-      if (error) throw new Error(error.message);
-      row.quantity = 0;
-    } else {
-      const { error } = await supabase
-        .from("pantry")
-        .update({
-          quantity: nextQuantity,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", row.id)
-        .eq("user_id", userId);
-      if (error) throw new Error(error.message);
-      row.quantity = nextQuantity;
-    }
+    deductions.set(row.id, {
+      id: row.id,
+      new_quantity: Math.max(0, nextQuantity),
+      action: nextQuantity <= 0 ? "delete" : "update",
+    });
   }
 }
 
-export async function consumePantryForCookedMeal(
+/**
+ * Computes the pantry deductions and cooking-behaviour observations for a
+ * completed meal, entirely in memory (no writes). ADR-009 Task 5 (BUG-03):
+ * the caller persists the returned plan via the `complete_cooked_meal` RPC
+ * in one transaction, so pantry changes and their observations can never
+ * partially commit.
+ */
+export async function planCookedMealConsumption(
   supabase: ConsumptionClient,
   input: CompleteCookingInput
-): Promise<void> {
+): Promise<{
+  deductions: PantryDeduction[];
+  observations: CookingObservationRow[];
+}> {
   const ingredients = input.ingredients.filter((item) =>
     item.actualIngredient.trim()
   );
 
   if (ingredients.length === 0) {
-    return;
+    return { deductions: [], observations: [] };
   }
 
   const { data, error } = await supabase
@@ -131,17 +153,12 @@ export async function consumePantryForCookedMeal(
     ...pantryRows.map((item) => item.ingredient_name),
   ]);
 
+  const deductions = new Map<string, PantryDeduction>();
   for (const ingredient of ingredients) {
-    await deductIngredientFromPantry(
-      supabase,
-      input.userId,
-      pantryRows,
-      ingredient,
-      resolver
-    );
+    planIngredientDeduction(pantryRows, ingredient, resolver, deductions);
   }
 
-  const observations = ingredients.map((item) => ({
+  const observations: CookingObservationRow[] = ingredients.map((item) => ({
     recipe_id: input.recipeId ?? null,
     recipe_name: input.recipeName,
     expected_ingredient: item.expectedIngredient,
@@ -153,11 +170,5 @@ export async function consumePantryForCookedMeal(
     action: observationAction(item),
   }));
 
-  const { error: observationError } = await supabase
-    .from("cooking_behavior_observations")
-    .insert(observations);
-
-  if (observationError) {
-    throw new Error(observationError.message);
-  }
+  return { deductions: Array.from(deductions.values()), observations };
 }

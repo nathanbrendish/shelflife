@@ -87,7 +87,8 @@ community_foods (autonomous — no user_id)
   │     ├──> food_subcategories (food_subcategory_id)
   │     └──> storage_locations (storage_location_id)
   └──< community_food_moderation_history (community_food_id)
-        └──> auth.users (moderated_by)
+        ├──> auth.users (actor_user_id)
+        └──> community_foods (target_community_food_id — merge target)
 
 food_categories
   └──< food_subcategories (food_category_id)
@@ -105,7 +106,7 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 **Purpose:** Per-user pantry items. The primary source of truth for what a user has at home. Classification columns are a cache; the community tables hold the authoritative classification.
 
 **Introduced:** Migration 001  
-**Extended by:** Migrations 002, 004, 007. Reconciled on Production by migrations 012, 013, 014 (see [Section 11](#11-production-schema-reconciliation-july-2026)) — no new columns beyond what 004/007 already defined; these migrations recreate the same end-state on Production where it had gone missing.
+**Extended by:** Migrations 002, 004, 007, 015. Reconciled on Production by migrations 012, 013, 014 (see [Section 11](#11-production-schema-reconciliation-july-2026)) — no new columns beyond what 004/007 already defined; these migrations recreate the same end-state on Production where it had gone missing. Migration 015 adds the partial unique stacking index.
 
 | Column | Type | Nullable | Default | Notes |
 |---|---|---|---|---|
@@ -138,6 +139,7 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 - `pantry_items_user_id_idx` ON `(user_id)` — all user-scoped queries
 - `pantry_user_storage_idx` ON `(user_id, storage_location_id)` — pantry browser grouping by storage
 - `pantry_canonical_food_idx` ON `(canonical_food_id)` — semantic matching
+- `pantry_user_canonical_stack_idx` UNIQUE ON `(user_id, canonical_food_id, COALESCE(expiry_date, sentinel), COALESCE(storage_location_id, sentinel), COALESCE(unit, '')) WHERE canonical_food_id IS NOT NULL` — concurrent receipt stacking identity
 
 **RLS Policies:**
 | Policy | Operation | Condition |
@@ -148,7 +150,7 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 | Users can delete their own pantry items | DELETE | `auth.uid() = user_id` |
 
 **Application usage:**
-- Written by: `addIngredient`, `updatePantryItem`, `deleteIngredient` (pantry.ts), `saveScannedIngredients` (receipt.ts), `consumePantryForCookedMeal` (pantry-consumption.ts via meals.ts)
+- Written by: `addIngredient`, `updatePantryItem`, `deleteIngredient` (pantry.ts), `saveScannedIngredients` (receipt.ts, via the `save_scanned_items` RPC), `completeCookedMeal` (meals.ts, via the `complete_cooked_meal` RPC using the plan produced by `planCookedMealConsumption` in pantry-consumption.ts)
 - Read by: `regenerateShoppingList`, `getShoppingList` (shopping.ts), `getCatalogueMealSuggestions`, `suggestMeals` (meals.ts), `getDashboardHomeData` (dashboard.ts), `/pantry` page
 - Stale cache refreshed by: `refresh_stale_pantry_classifications()` RPC on `/pantry` page load
 
@@ -199,8 +201,8 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 | Users can manage their own shopping list | ALL | `auth.uid() = user_id` |
 
 **Application usage:**
-- Written by: `regenerateShoppingList` (DELETE all + INSERT), `addMissingIngredientsToShoppingList` (INSERT only), `toggleShoppingItem` (UPDATE `checked`), `clearCheckedItems` (DELETE WHERE `checked`), `clearShoppingList` (DELETE all)
-- All inserts go through `insertShoppingListRows()` in `shopping-list-persistence.ts`
+- Written by: `regenerateShoppingList` (atomic DELETE-all + INSERT via the `regenerate_shopping_list` RPC — [§5.6](#56-transactional-write-boundaries)), `addMissingIngredientsToShoppingList` (INSERT only), `toggleShoppingItem` (UPDATE `checked`), `clearCheckedItems` (DELETE WHERE `checked`), `clearShoppingList` (DELETE all)
+- `addMissingIngredientsToShoppingList` inserts through `insertShoppingListRows()` in `shopping-list-persistence.ts`; `regenerateShoppingList` computes its rows in TypeScript and passes them to the `regenerate_shopping_list` RPC, which performs the delete + insert as one transaction
 - Read by: `getShoppingList` (SELECT ordered by `created_at`)
 - Pages: `/shopping`, `/dashboard` (summary counts only)
 
@@ -360,8 +362,9 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 **RLS Policies:**
 | Policy | Operation | Condition |
 |---|---|---|
-| Authenticated users can view community foods | SELECT | `true` (all authenticated) |
 | Super admins can manage community foods | ALL | `is_super_admin()` |
+
+Authenticated users do not have direct table access. Application reads and observations use the granted `SECURITY DEFINER` community-food RPCs, which provide the controlled access boundary.
 
 **Application usage:**
 - Written by: `record_community_food_observation` RPC (implicit via learnAndSnapshot), `classify_community_food` RPC, `refresh_community_food_aggregate` RPC
@@ -391,8 +394,9 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 **RLS Policies:**
 | Policy | Operation | Condition |
 |---|---|---|
-| Authenticated users can view community food aliases | SELECT | `true` |
 | Super admins can manage community food aliases | ALL | `is_super_admin()` |
+
+Authenticated users do not have direct table access. Alias reads and writes occur through granted `SECURITY DEFINER` community-food RPCs.
 
 **Application usage:**
 - Written by: `record_community_food_observation` RPC (on every pantry add/update/scan)
@@ -429,8 +433,9 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 **RLS Policies:**
 | Policy | Operation | Condition |
 |---|---|---|
-| Authenticated users can contribute food votes | INSERT | `true` (all authenticated) |
 | Super admins can view community food votes | SELECT | `is_super_admin()` |
+
+Authenticated users do not have direct `SELECT` or `INSERT` access. Contributions are inserted through the granted `SECURITY DEFINER` `record_community_food_observation` flow.
 
 **Application usage:**
 - Written by: `record_community_food_observation` RPC (implicit, called on every pantry mutation)
@@ -448,11 +453,11 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 |---|---|---|---|---|
 | `id` | uuid | NOT NULL | `gen_random_uuid()` | Primary key |
 | `community_food_id` | uuid | NOT NULL | — | FK → `community_foods(id)` ON DELETE CASCADE |
-| `action` | text | NOT NULL | — | CHECK IN `('approved', 'rejected', 'locked', 'edited', 'merged')` |
-| `moderated_by` | uuid | NOT NULL | — | FK → `auth.users(id)` ON DELETE SET NULL (note: CASCADE may differ) |
-| `before_state` | jsonb | NULL | — | Snapshot of relevant fields before action |
-| `after_state` | jsonb | NULL | — | Snapshot after action |
-| `notes` | text | NULL | — | Optional moderator notes |
+| `action` | text | NOT NULL | — | CHECK IN `('approved', 'rejected', 'merged', 'locked', 'edited')` |
+| `actor_user_id` | uuid | NOT NULL | — | FK → `auth.users(id)` ON DELETE RESTRICT. The moderating SUPER_ADMIN (`auth.uid()` inside the RPC) |
+| `target_community_food_id` | uuid | NULL | — | FK → `community_foods(id)` ON DELETE SET NULL. The merge target; populated only by `merged` actions |
+| `before_values` | jsonb | NOT NULL | `'{}'` | Snapshot of the food's relevant fields before the action |
+| `after_values` | jsonb | NOT NULL | `'{}'` | Snapshot after the action — this is also the partial update applied to `community_foods` |
 | `created_at` | timestamptz | NOT NULL | `now()` | |
 
 **RLS Policies:**
@@ -462,7 +467,7 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 | Super admins can insert moderation history | INSERT | `is_super_admin()` |
 
 **Application usage:**
-- Written by: `approveCommunityFood`, `rejectCommunityFood`, `lockCommunityFoodEntry`, `editCommunityFood`, `mergeCommunityFoods` (community-intelligence.ts)
+- Written by: `approveCommunityFood`, `rejectCommunityFood`, `lockCommunityFoodEntry`, `editCommunityFood`, `mergeCommunityFoods` (community-intelligence.ts) — all via the `moderate_community_food` RPC ([§5.6](#56-transactional-write-boundaries)), which updates `community_foods` and inserts the matching history row in **one transaction** (ADR-009 Task 1 / BUG-04)
 - Read by: `getCommunityIntelligenceDashboardData` (last 25 entries)
 
 ---
@@ -663,7 +668,7 @@ cooking_behavior_observations (no user_id — anonymous INSERT only)
 **Note:** There is deliberately no SELECT policy for regular users. The data is insert-only from the application perspective. SUPER_ADMIN access is via service role or direct database access.
 
 **Application usage:**
-- Written by: `consumePantryForCookedMeal` in `pantry-consumption.ts` (called by `completeCookedMeal`)
+- Written by: `completeCookedMeal` (meals.ts) via the `complete_cooked_meal` RPC, using the observation rows computed by `planCookedMealConsumption` in `pantry-consumption.ts`
 - Read by: Not currently read by any application code. Reserved for future analytics
 
 **Action values:**
@@ -756,6 +761,23 @@ Both are STABLE, SECURITY DEFINER with `search_path = public`.
 
 ---
 
+### 5.6 Transactional Write Boundaries
+
+Introduced by migration 015 under [ADR-009](./adr/ADR-009-transactional-write-patterns.md). Each function is `SECURITY DEFINER`, fixes its `search_path` to `public`, derives the caller from `auth.uid()`, and commits or rolls back its dependent writes as one PostgreSQL transaction.
+
+| Function | Signature | Returns | Atomic operation |
+|---|---|---|---|
+| `moderate_community_food` | `(text, uuid, jsonb, jsonb, uuid)` | void | Updates a community food and inserts its moderation-history record |
+| `regenerate_shopping_list` | `(jsonb)` | `SETOF shopping_list_items` | Replaces the caller's persisted shopping list |
+| `replace_meal_plan` | `(integer, jsonb)` | uuid | Replaces the caller's plan header and plan items |
+| `reorder_meal_plan_items` | `(jsonb)` | void | Updates all supplied meal-plan sort positions |
+| `complete_cooked_meal` | `(jsonb, jsonb)` | void | Applies pantry deductions and inserts cooking observations |
+| `save_scanned_items` | `(jsonb)` | void | Applies a receipt batch using the precomputed stacking plan |
+
+`save_scanned_items` is protected by `pantry_user_canonical_stack_idx`, whose identity includes `COALESCE(unit, '')`. Concurrent rows with the same raw stacking identity are merged by summing quantity; empty-string units are normalized to `NULL` at the RPC boundary.
+
+---
+
 ## 6. Triggers
 
 ### `community_foods_classification_version` (BEFORE UPDATE)
@@ -781,6 +803,7 @@ This selective bump means unrelated field updates (e.g. incrementing `usage_coun
 | `pantry_items_user_id_idx` | `pantry` | `(user_id)` | All user-scoped pantry queries |
 | `pantry_user_storage_idx` | `pantry` | `(user_id, storage_location_id)` | Pantry browser grouped by storage location |
 | `pantry_canonical_food_idx` | `pantry` | `(canonical_food_id)` | `insertOrStackPantryItem` stacking lookup |
+| `pantry_user_canonical_stack_idx` | `pantry` | User, canonical food, expiry, storage, raw unit (null-safe) | Partial unique index used by `save_scanned_items` to merge concurrent identical stacking identities |
 | `meals_saved_user_id_idx` | `meals_saved` | `(user_id)` | |
 | `meal_plans_user_id_idx` | `meal_plans` | `(user_id)` | |
 | `meal_plan_items_plan_id_idx` | `meal_plan_items` | `(plan_id)` | |
@@ -815,9 +838,10 @@ All indexes above were confirmed present on both Development and Production as o
 | 009 | `009_shopping_list_metadata.sql` | v2 | Adds `needed_for_meals`, `shortage_label`, `source` to `shopping_list_items` |
 | 010 | `010_shopping_demand_details.sql` | v2 | Adds `demand_quantity`, `demand_unit`, `pantry_quantity`, `pantry_unit`, `used_by_meals` to `shopping_list_items` |
 | 011 | `011_cooking_behavior_observations.sql` | v2 | Creates `cooking_behavior_observations` table (anonymous, INSERT-only) |
-| 012 | `012_reconcile_production_schema.sql` | Post-v2.0 maintenance | Reconciles `pantry`'s migration 004 (`category`, `subcategory`) and migration 007 (storage/classification cache columns, FKs, indexes, `refresh_stale_pantry_classifications()`) end-state on Production. Written before the full-drift forensic audit; has an undeclared dependency on tables created by migration 013 — see [Section 11](#11-production-schema-reconciliation-july-2026) |
+| 012 | `012_reconcile_production_schema.sql` | Post-v2.0 maintenance | Reconciles `pantry`'s migration 004 (`category`, `subcategory`) and migration 007 (storage/classification cache columns, FKs, indexes, `refresh_stale_pantry_classifications()`) end-state on Production. Its FK targets are ordinarily created by migrations 004/005; the July 2026 drift incident required migration 013 to recreate those missing objects before 012 could execute — see [Section 11](#11-production-schema-reconciliation-july-2026) |
 | 013 | `013_reconcile_production_to_development.sql` | Post-v2.0 maintenance | Comprehensive, additive, idempotent reconciliation of all schema drift found by forensic audit: 10 missing tables, 16 missing `pantry`/`shopping_list_items` columns, 4 missing FKs, 13 missing indexes, 15 missing functions, 1 missing trigger, 3 renamed `pantry` RLS policies, plus seed/reference data. A no-op on Development |
 | 014 | `014_defensive_pantry_prerequisite_guard.sql` | Post-v2.0 maintenance | Forward-only hardening of migration 012: restates its four FK-bearing `pantry` columns so each is only added if its referenced table exists, instead of raising an error. Does not edit 012 |
+| 015 | `015_transactional_write_rpcs.sql` | ADR-009 Phase 1 | Adds six transactional write RPCs and the `pantry_user_canonical_stack_idx` partial unique index. Converts multi-request write sequences into atomic database operations |
 
 ---
 
@@ -829,26 +853,25 @@ All indexes above were confirmed present on both Development and Production as o
 | Deprecated `primary_category`/`secondary_category` on `community_foods` | `community_foods` table | Low | Free-text columns from migration 004. Superseded by `food_category_id` in migration 006 |
 | Deprecated `category` on `community_food_votes` | `community_food_votes` table | Low | Free-text column from migration 004 |
 | No read SELECT RLS policy on `cooking_behavior_observations` | `cooking_behavior_observations` | Low | By design — data is write-only from app layer. Would need service role for analytics |
-| `generateMealPlan` contains `console.log` debug statements | `planner.ts` | Low | Logged in production. Should be replaced with structured logging |
-| `pantry` stacking is not atomic | `insertOrStackPantryItem` | Low | Two concurrent identical inserts could create duplicate rows. Acceptable at current scale |
-| `regenerateShoppingList` delete-then-insert is not atomic | `shopping.ts` | Low | Brief window where shopping list is empty. Accepted at current scale |
+| Compatible units with different raw strings can form separate stacks under cross-request concurrency (BUG-05) | `save_scanned_items` / `pantry_user_canonical_stack_idx` | Low | The index safely merges identical raw-unit identities, but concurrent compatible synonyms such as `L` and `litre` can pass separate TypeScript snapshots and remain separate rows. No quantity is lost. Deferred to Phase 2; see [Section 10](#10-future-schema-improvements) |
 | User roles must be assigned via database dashboard | `user_roles` | Medium | No UI for assigning SUPER_ADMIN. Requires direct SQL or Supabase dashboard access |
 | `shopping_list_items.category` defaults to `'Other'` | `shopping_list_items` | Low | Migration 002 default. Category now uses `categorizeIngredient()` at write time; legacy rows with `'Other'` may exist |
 | `public.pantry_items` exists only on Production | `pantry_items` table | Low (data), Medium (confusion risk) | Legacy artifact from before migration 001's table was renamed `pantry_items` → `pantry`; applied to Production before that rename with no corresponding rename ever migrated. Not referenced anywhere in `src/`. Deliberately left untouched by the July 2026 reconciliation — see [Section 11](#11-production-schema-reconciliation-july-2026). Removal requires a separate, explicitly reviewed migration since it may hold real historical rows |
-| Migration 012 cannot succeed on a from-scratch database replay | `012_reconcile_production_schema.sql` | Low | 012 adds FK-bearing `pantry` columns assuming their referenced tables already exist. This is only satisfied because migration 013 (which creates those tables) has already run against every real environment before 012 is ever executed there. A migration runner replaying 001→014 from an empty database will still fail at 012, since a runner aborts the whole batch at the first failure and nothing numbered after 012 can prevent it from failing. Migration 014 hardens the same logic defensively for any database where it is reached, but cannot fix 012 itself. Accepted, documented limitation — see [Section 11](#11-production-schema-reconciliation-july-2026) |
+| Migration 012 requires its FK-referenced tables to exist at execution time | `012_reconcile_production_schema.sql` | Low | This is a drifted-history limitation: 012 fails when migrations 004–011 are recorded as applied but their prerequisite objects are absent, as in the July 2026 Production incident. It does not fail on a clean, ordered replay because migrations 004/005/007 create the prerequisites before 012 runs. A from-scratch `supabase db reset` (001→014) succeeds, and the migration-chain CI job now verifies this on every PR. See [Section 11](#11-production-schema-reconciliation-july-2026) and [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md) |
 
 ---
 
 ## 10. Future Schema Improvements
 
-> All items below are architectural suggestions based on current limitations. None are implemented.
+> Status is explicit: future items are not implemented unless marked **DONE**.
 
 | Improvement | Rationale |
 |---|---|
+| **DONE — FUP-1: sum quantities on a stacking conflict** | Migration 015 uses `quantity = pantry.quantity + EXCLUDED.quantity` in `save_scanned_items`; integration tests verify retries/concurrent identity conflicts preserve both quantities |
+| **Phase 2 — BUG-05: compatible-but-different raw-unit concurrency** | Cross-request inserts such as `L` and `litre` can miss TypeScript's pre-write merge and use distinct database identity keys. No data is lost, but quantities may remain in separate rows. Requires a canonical-unit concurrency design |
 | DROP deprecated text columns | Clean up `pantry.category`, `pantry.subcategory`, `community_foods.primary_category`, etc. after verifying no queries reference them |
 | Add `user_id` to `cooking_behavior_observations` as optional | Would enable per-user cooking personalisation without making all data personally identifiable |
 | Normalise `meal_plan_items.ingredients_used` | Currently JSONB arrays. Normalised junction table would allow ingredient-level querying |
-| Add composite unique constraint on `pantry` for stacking | `(user_id, canonical_food_id, expiry_date, storage_location_id)` — currently enforced in application code; a DB constraint would guarantee integrity |
 | Partial index on `community_foods` for `review_required = true` | Would speed up the moderation queue query |
 | Add `updated_at` to `shopping_list_items` | Useful for incremental sync if a mobile client is added |
 | `storage_location_id` on `shopping_list_items` | Would allow "buy for Fridge" shopping organisation |
@@ -899,12 +922,13 @@ Fixing this required either editing migration 012 or using `supabase migration r
 
 **Relationship with migration 012:** 014 does not edit, replace, or supersede 012. It is a separate, additive migration that restates the same four column additions defensively: each is only added, together with its foreign key (`NOT VALID` + `VALIDATE CONSTRAINT`, matching 012's locking-safety pattern), if `to_regclass()` confirms its referenced table exists; otherwise that one column is skipped with a `RAISE NOTICE` instead of an error. It is a pure no-op wherever 012 (or 013) already completed successfully — including Development today.
 
-**Known limitation regarding brand-new databases:** nothing numbered after 012 can make 012 itself succeed on a from-scratch replay of migration history (001 → … → 012) against an empty database, because a migration runner aborts the entire batch at the first failure — 013 and 014 never get a chance to run before 012 fails. This is an accepted, permanent, disclosed limitation. It does not affect Development or Production, both of which reached their current state through the one-time manual pre-application described above, not through a from-scratch replay.
+**Correction — 13 July 2026:** the original incident narrative is retained above, but a later claim that migration 012 cannot succeed on a from-scratch replay was incorrect. Migration 012 fails only when its FK-referenced tables are absent at execution time — under drifted or partially-applied migration history, as in the July 2026 Production incident where migrations 004–011 were recorded as applied but their objects were missing. It does not fail on a clean, ordered replay: migrations 004/005/007 create those prerequisites before 012 runs. A from-scratch `supabase db reset` (001→014) succeeds, and the migration-chain CI job introduced under ADR-009 now verifies this on every PR. The incorrect claim generalized an assumption from the Production incident without empirical testing; Development had reached its state through manual pre-application, not a clean replay. This reinforces ADR-008's central lesson: history and prose are not proof—verify schema behavior directly. See [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md) for the full corrected record.
 
 ### 11.6 Lessons and Permanent Rules
 
 - **Development is the source of truth.** Production must always be brought to match Development — never the reverse.
 - **Migration history alone cannot be trusted.** `supabase_migrations.schema_migrations` records that a migration ran; it does not prove the resulting schema is correct or complete. A direct, read-only forensic schema comparison between Development and Production is now part of every release, not an occasional audit.
+- **Bootstrap and disaster-recovery claims require executable evidence.** Documentation about schema or migration-chain behavior must cite the clean migration-chain CI job that proves it; migration history and narrative accounts are not sufficient evidence.
 - **Reconciliation migrations must always be additive.** No `DROP`, no destructive `UPDATE`/`DELETE`. Every statement in 013 and 014 is a column/table/function/index/policy addition or an idempotent replace.
 - **Old migrations must never be rewritten after deployment.** Migration 012's undeclared dependency was fixed by adding migration 014, not by editing 012 — even though 012 had never successfully run on Production at the time the defect was found.
 - **`supabase migration repair` must never be used as a shortcut.** It marks a version applied without running its SQL. It is only appropriate after the target schema has already been independently verified — by direct introspection — to match what that migration would have produced, never as a way to make a failing `db push` "succeed."

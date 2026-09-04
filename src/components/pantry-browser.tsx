@@ -9,13 +9,12 @@ import {
   List,
   MapPin,
   Pencil,
-  Trash2,
 } from "lucide-react";
 import {
   classifyPantryFood,
-  deleteIngredient,
   updatePantryItem,
 } from "@/app/actions/pantry";
+import { DeleteIngredientButton } from "@/components/delete-ingredient-button";
 import { PantryEditModal } from "@/components/pantry-edit-modal";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -207,17 +206,12 @@ export function PantryBrowser({
             >
               <Pencil className="h-4 w-4" />
             </Button>
-            <form action={deleteIngredient}>
-              <input type="hidden" name="id" value={item.id} />
-              <Button
-                type="submit"
-                variant="danger"
-                className="min-w-11 px-3"
-                aria-label={`Remove ${item.ingredient_name}`}
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </form>
+            <DeleteIngredientButton
+              id={item.id}
+              label={item.ingredient_name}
+              variant="icon"
+              className="shrink-0"
+            />
           </div>
         </Card>
       </li>
@@ -258,16 +252,11 @@ export function PantryBrowser({
         >
           <Pencil className="h-3.5 w-3.5" />
         </button>
-        <form action={deleteIngredient} className="shrink-0">
-          <input type="hidden" name="id" value={item.id} />
-          <button
-            type="submit"
-            className="pp-focus-ring rounded-lg p-1.5 text-muted hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/40"
-            aria-label={`Remove ${item.ingredient_name}`}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
-        </form>
+        <DeleteIngredientButton
+          id={item.id}
+          label={item.ingredient_name}
+          variant="compact"
+        />
       </li>
     );
   };

@@ -15,7 +15,7 @@ import { parseMealSuggestionsResponse } from "@/lib/gemini/parse-meals";
 import { withGeminiRetry } from "@/lib/gemini/retry";
 import { buildFoodResolver } from "@/lib/food-resolver";
 import {
-  consumePantryForCookedMeal,
+  planCookedMealConsumption,
   type CookingUsageInput,
 } from "@/lib/pantry-consumption";
 import { getAllRecipes } from "@/lib/recipes";
@@ -335,25 +335,51 @@ export async function completeCookedMeal(
 
   try {
     const { supabase, user } = await getAuthenticatedUser();
-    await consumePantryForCookedMeal(supabase, {
-      userId: user.id,
-      recipeId: input.recipeId ?? null,
-      recipeName,
-      ingredients,
+
+    // Matching/deduction computation stays in TS (pantry-consumption.ts);
+    // only the final plan is persisted, atomically, via the RPC (ADR-009
+    // Task 5 / BUG-03). Partial cooking completion — pantry changed but
+    // observations lost, or vice versa — is no longer possible.
+    const { deductions, observations } = await planCookedMealConsumption(
+      supabase,
+      {
+        userId: user.id,
+        recipeId: input.recipeId ?? null,
+        recipeName,
+        ingredients,
+      }
+    );
+
+    const { error } = await supabase.rpc("complete_cooked_meal", {
+      p_deductions: deductions,
+      p_observations: observations,
     });
 
-    await triggerShoppingListRegeneration();
+    if (error) {
+      console.error("[completeCookedMeal] complete_cooked_meal RPC failed:", error);
+      return { success: false, error: "Failed to update your pantry." };
+    }
+
+    // Shopping regen happens after the atomic pantry+observation write
+    // succeeds, per Task 5's dependency on the Task 2 RPC. The pantry
+    // deduction is already committed and complete_cooked_meal is not
+    // idempotent, so a regen failure here must not be reported as a failed
+    // cook (M-1) — that would invite a retry that double-deducts the pantry.
+    try {
+      await triggerShoppingListRegeneration();
+    } catch (regenError) {
+      console.error(
+        "[completeCookedMeal] shopping regen failed (non-fatal):",
+        regenError
+      );
+    }
+
     revalidateMealCompletionPaths();
 
     return { success: true };
   } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Failed to update your pantry.",
-    };
+    console.error("[completeCookedMeal] failed:", error);
+    return { success: false, error: "Failed to update your pantry." };
   }
 }
 

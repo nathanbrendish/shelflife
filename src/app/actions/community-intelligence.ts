@@ -44,32 +44,43 @@ async function getFoodOrThrow(
     .single();
 
   if (error || !data) {
-    throw new Error(error?.message ?? "Community food was not found.");
+    if (error) {
+      console.error("[getFoodOrThrow] community_foods read failed:", error);
+    }
+    throw new Error("Community food was not found.");
   }
 
   return data as CommunityFoodRecord;
 }
 
+/**
+ * Applies a `community_foods` change and its moderation-history audit row in
+ * one transaction (ADR-009 Task 1 / BUG-04). Previously these were two
+ * independent writes — an update followed by a separate insert that could
+ * fail on its own (there was no INSERT policy for it at all), leaving the
+ * data change committed with no audit trail. The RPC re-asserts
+ * `is_super_admin()` internally; `requireSuperAdmin()` remains the read-path
+ * / page-access guard.
+ */
 async function recordModerationAction(
   supabase: Awaited<ReturnType<typeof requireSuperAdmin>>["supabase"],
-  actorUserId: string,
   communityFoodId: string,
   action: CommunityFoodModerationAction,
   beforeValues: Record<string, unknown>,
   afterValues: Record<string, unknown>,
   targetCommunityFoodId: string | null = null
 ) {
-  const { error } = await supabase.from("community_food_moderation_history").insert({
-    community_food_id: communityFoodId,
-    action,
-    actor_user_id: actorUserId,
-    target_community_food_id: targetCommunityFoodId,
-    before_values: beforeValues,
-    after_values: afterValues,
+  const { error } = await supabase.rpc("moderate_community_food", {
+    p_action: action,
+    p_food_id: communityFoodId,
+    p_before: beforeValues,
+    p_after: afterValues,
+    p_target_food_id: targetCommunityFoodId,
   });
 
   if (error) {
-    throw new Error(error.message);
+    console.error("[recordModerationAction] moderate_community_food RPC failed:", error);
+    throw new Error("Failed to record this moderation action. Please try again.");
   }
 }
 
@@ -218,12 +229,7 @@ export async function approveCommunityFood(
       reviewed_at: new Date().toISOString(),
       reviewed_by: userId,
     };
-    const { error } = await supabase
-      .from("community_foods")
-      .update(after)
-      .eq("id", foodId);
-    if (error) throw new Error(error.message);
-    await recordModerationAction(supabase, userId, foodId, "approved", before, after);
+    await recordModerationAction(supabase, foodId, "approved", before, after);
     revalidatePlatform();
     return { success: true };
   } catch (error) {
@@ -244,12 +250,7 @@ async function lockCommunityFood(
       reviewed_at: new Date().toISOString(),
       reviewed_by: userId,
     };
-    const { error } = await supabase
-      .from("community_foods")
-      .update(after)
-      .eq("id", foodId);
-    if (error) throw new Error(error.message);
-    await recordModerationAction(supabase, userId, foodId, action, before, after);
+    await recordModerationAction(supabase, foodId, action, before, after);
     revalidatePlatform();
     return { success: true };
   } catch (error) {
@@ -270,7 +271,7 @@ export async function editCommunityFood(
   values: EditableCommunityFood
 ): Promise<CommunityActionResult> {
   try {
-    const { supabase, userId } = await requireSuperAdmin();
+    const { supabase } = await requireSuperAdmin();
     const before = await getFoodOrThrow(supabase, foodId);
     const canonicalName = values.canonicalName.trim();
     if (!canonicalName) {
@@ -287,12 +288,7 @@ export async function editCommunityFood(
       default_freezer_life_days: values.defaultFreezerLifeDays,
       updated_at: new Date().toISOString(),
     };
-    const { error } = await supabase
-      .from("community_foods")
-      .update(after)
-      .eq("id", foodId);
-    if (error) throw new Error(error.message);
-    await recordModerationAction(supabase, userId, foodId, "edited", before, after);
+    await recordModerationAction(supabase, foodId, "edited", before, after);
     revalidatePlatform();
     return { success: true };
   } catch (error) {
@@ -355,27 +351,23 @@ export async function mergeCommunityFoods(
       .eq("community_food_id", sourceFoodId);
     if (votesError) throw new Error(votesError.message);
 
-    const after = {
-      status: "locked",
-      review_required: false,
-      reviewed_at: new Date().toISOString(),
-      reviewed_by: userId,
-    };
-    const { error: sourceError } = await supabase
-      .from("community_foods")
-      .update(after)
-      .eq("id", sourceFoodId);
-    if (sourceError) throw new Error(sourceError.message);
-
     const { error: refreshError } = await supabase.rpc(
       "refresh_community_food_aggregate",
       { food_id: targetFoodId }
     );
     if (refreshError) throw new Error(refreshError.message);
 
+    const after = {
+      status: "locked",
+      review_required: false,
+      reviewed_at: new Date().toISOString(),
+      reviewed_by: userId,
+    };
+
+    // Single transaction: locking the source food and recording the merge
+    // audit row commit together (ADR-009 Task 1 / BUG-04).
     await recordModerationAction(
       supabase,
-      userId,
       sourceFoodId,
       "merged",
       source,

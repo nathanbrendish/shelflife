@@ -207,3 +207,4 @@ Key files:
 - [docs/architecture.md](../architecture.md)
 - [ADR-001: Next.js](./ADR-001-nextjs.md)
 - [ADR-006: Shopping Persistence](./ADR-006-shopping-persistence.md)
+- [ADR-009: Transactional Write Patterns](./ADR-009-transactional-write-patterns.md) — atomic persistence boundary for multi-write Server Actions

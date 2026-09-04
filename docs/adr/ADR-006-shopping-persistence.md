@@ -207,6 +207,8 @@ Rejected: Disproportionate complexity for the problem being solved. The persiste
 
 > **Note:** As of v2.0, full regeneration deletes *all* items (not just `meal_plan` items). Manual item protection across regeneration cycles is listed in [docs/product-roadmap.md](../product-roadmap.md#5-next--v21) as a v2.1 improvement.
 
+> **Supersession note — 13 July 2026:** The previously accepted partial-write and lost-concurrent-Add-Missing trade-off is superseded as an architectural decision by [ADR-009](./ADR-009-transactional-write-patterns.md). ADR-009 requires dependent writes to use transactional RPCs. Until its Phase 1 migration and action changes land, the v2.0 implementation described above remains the deployed behavior.
+
 ---
 
 ## Implementation
@@ -237,3 +239,4 @@ Rejected: Disproportionate complexity for the problem being solved. The persiste
 - [docs/database-schema.md — shopping_list_items](../database-schema.md)
 - [ADR-003: Server Actions](./ADR-003-server-actions.md)
 - [ADR-005: Semantic Matching](./ADR-005-semantic-matching.md)
+- [ADR-009: Transactional Write Patterns](./ADR-009-transactional-write-patterns.md) — supersedes the accepted partial-write and concurrency trade-off

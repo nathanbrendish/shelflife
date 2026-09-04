@@ -1,6 +1,5 @@
-import { Package, Trash2 } from "lucide-react";
-import { deleteIngredient } from "@/app/actions/pantry";
-import { Button } from "@/components/ui/button";
+import { Package } from "lucide-react";
+import { DeleteIngredientButton } from "@/components/delete-ingredient-button";
 import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatExpiryLabel, getExpiryStatus } from "@/lib/expiry";
@@ -80,13 +79,11 @@ export function PantryList({ items }: PantryListProps) {
                 </div>
               </div>
 
-              <form action={deleteIngredient} className="shrink-0">
-                <input type="hidden" name="id" value={item.id} />
-                <Button type="submit" variant="danger" className="h-10 px-4">
-                  <Trash2 className="h-4 w-4" aria-hidden="true" />
-                  Remove
-                </Button>
-              </form>
+              <DeleteIngredientButton
+                id={item.id}
+                label={item.ingredient_name}
+                variant="labelled"
+              />
             </Card>
           </li>
         );

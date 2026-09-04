@@ -294,8 +294,8 @@ supabase migration list
 ```bash
 # Preferred: create an empty file with the correct naming convention
 # Naming: NNN_descriptive_snake_case_name.sql
-# Example (the next available number as of migration 014):
-touch supabase/migrations/015_add_user_preferences.sql
+# Example (the next available number as of migration 015):
+touch supabase/migrations/016_add_user_preferences.sql
 ```
 
 See [Migration naming conventions](#migration-naming-conventions) below.
@@ -307,7 +307,7 @@ See [Migration naming conventions](#migration-naming-conventions) below.
 supabase db reset
 ```
 
-If there is no `supabase/config.toml`, a full local reset is not possible without one. In that case, apply migrations manually via `supabase db push` against a fresh project.
+The repository now includes `supabase/config.toml` and a deterministic `supabase/seed.sql`, so `supabase db reset` replays the full migration chain (001→latest) and seeds a fresh local database. This is the same clean replay the CI `migrations` job runs on every PR.
 
 ---
 
@@ -340,7 +340,16 @@ If you suspect environment variable issues in development, add a temporary log (
 npm test
 ```
 
-This runs `node --test tests/*.test.mjs`. The test suite is in `tests/recipe-shopping-list.test.mjs` and uses Node.js's built-in test runner (no external test framework required).
+This runs `node --test tests/*.test.mjs`. The unit suite is in `tests/recipe-shopping-list.test.mjs` and uses Node.js's built-in test runner (no external test framework required). It is dependency-free and does not require a database.
+
+### Integration (fault-injection) tests
+
+```bash
+supabase db reset            # clean replay of migrations 001 -> latest
+npm run test:fault-injection # node --test tests-integration/*.test.mjs
+```
+
+`tests-integration/fault-injection.test.mjs` runs against a live local Supabase Postgres and proves each ADR-009 transactional RPC is atomic (it forces a later write to fail and asserts the whole transaction rolled back). It is deliberately excluded from `npm test` and is run by the CI `migrations` job immediately after a clean `supabase db reset`. Requires `SUPABASE_DB_URL` (see `.github/workflows/ci.yml`).
 
 ### What the tests cover
 
@@ -606,6 +615,8 @@ NEXT_PUBLIC_SITE_URL  (set to https://myshelflife.co.uk for production)
 [ ] npm run build passes locally with exit code 0
 [ ] npm run lint passes with zero errors
 [ ] npm test passes
+[ ] Migration-chain CI passes a clean `supabase db reset`; cite this job for any
+    bootstrap or disaster-recovery claim (history and prose are not proof)
 [ ] All new migrations applied to the target Supabase project
 [ ] Forensic schema audit confirms Development and Production match (see Section 11.4) —
     not just a matching `supabase migration list`
@@ -753,6 +764,7 @@ git branch
 | [docs/product-roadmap.md](./product-roadmap.md) | Strategic evolution and planned features |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Engineering standards and contribution process |
 | [docs/adr/](./adr/) | Architecture Decision Records |
+| [ADR-009: Transactional Write Patterns](./adr/ADR-009-transactional-write-patterns.md) | Atomic persistence rules for multi-step Server Actions |
 | [docs/community-food-intelligence.md](./community-food-intelligence.md) | Community Food Intelligence deep-dive |
 
 ---
@@ -766,8 +778,9 @@ git branch
 - Return typed error responses — never throw to the client
 - Run `npm test && npm run lint && npm run build` before pushing
 - Use `revalidatePath()` after all mutations that affect page data
-- Use `insertOrStackPantryItem()` for every pantry insert — never insert directly
-- Use `insertShoppingListRows()` for every shopping list insert — never insert directly
+- Use `insertOrStackPantryItem()` for single-item pantry writes (`addIngredient`); batch receipt saves go through the `save_scanned_items` RPC (ADR-009) — never insert into `pantry` directly outside these paths
+- Use `insertShoppingListRows()` for the additive "Add Missing" path; full regeneration goes through the `regenerate_shopping_list` RPC (ADR-009) — never insert into `shopping_list_items` directly outside these paths
+- Any Server Action performing more than one dependent write must persist through a transactional RPC (ADR-009), not sequential Supabase calls
 - Use `addMissingIngredientsToShoppingList()` via `MissingIngredientsSection` — never build custom Add Missing implementations
 - Add `IF NOT EXISTS` to every migration statement
 - Keep community learning non-blocking: wrap in try/catch, return empty cache on failure

@@ -302,24 +302,44 @@ export async function classifyPantryFood(
   return { success: true };
 }
 
-export async function deleteIngredient(formData: FormData) {
+/**
+ * ADR-009 Task 7 (BUG-11): returns a safe `{ success, error? }` contract and
+ * only regenerates the shopping list once the delete is confirmed to have
+ * actually removed a row — a failed delete now surfaces to the UI instead of
+ * silently proceeding as if it had succeeded.
+ */
+export async function deleteIngredient(
+  _prevState: PantryFormState,
+  formData: FormData
+): Promise<PantryFormState> {
   const id = formData.get("id") as string;
 
   if (!id) {
-    return;
+    return { error: "Missing ingredient id." };
   }
 
   const { supabase, user } = await getAuthenticatedUser();
 
-  await supabase
+  const { error, count } = await supabase
     .from("pantry")
-    .delete()
+    .delete({ count: "exact" })
     .eq("id", id)
     .eq("user_id", user.id);
+
+  if (error) {
+    console.error("[deleteIngredient] delete failed:", error);
+    return { error: "Failed to remove ingredient. Please try again." };
+  }
+
+  if (!count) {
+    return { error: "Ingredient not found." };
+  }
 
   await triggerShoppingListRegeneration();
 
   revalidatePath("/pantry");
   revalidatePath("/dashboard");
   revalidatePath("/meals");
+
+  return null;
 }

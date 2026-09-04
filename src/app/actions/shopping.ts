@@ -12,7 +12,6 @@ import {
   type ShoppingListSummary,
 } from "@/lib/shopping-list";
 import {
-  insertShoppingListRows,
   SHOPPING_LIST_SELECT,
   type ShoppingListInsertRow,
 } from "@/lib/shopping-list-persistence";
@@ -235,11 +234,8 @@ export async function regenerateShoppingList(): Promise<ShoppingListResult> {
     planItems.length > 0
   );
 
-  await supabase.from("shopping_list_items").delete().eq("user_id", user.id);
-
-  const rows: ShoppingListInsertRow[] = [
+  const rows: Omit<ShoppingListInsertRow, "user_id">[] = [
     ...computed.map((item) => ({
-      user_id: user.id,
       ingredient_name: item.ingredient_name,
       quantity: item.quantity,
       unit: item.unit,
@@ -258,7 +254,6 @@ export async function regenerateShoppingList(): Promise<ShoppingListResult> {
       source: "meal_plan" as const,
     })),
     ...manualItems.map((item) => ({
-      user_id: user.id,
       ingredient_name: item.ingredient_name,
       quantity: item.quantity,
       unit: item.unit,
@@ -275,11 +270,25 @@ export async function regenerateShoppingList(): Promise<ShoppingListResult> {
     })),
   ];
 
+  // Single transaction: delete the user's previous rows and insert the
+  // final computed set atomically (ADR-009 Task 2). An insert failure now
+  // rolls back the delete too, so the previous list is never lost.
+  const { data: persisted, error: regenerateError } = await supabase.rpc(
+    "regenerate_shopping_list",
+    { rows }
+  );
+
+  if (regenerateError) {
+    console.error(
+      "[regenerateShoppingList] regenerate_shopping_list RPC failed:",
+      regenerateError
+    );
+    throw new Error("Unable to update your shopping list. Please try again.");
+  }
+
   if (rows.length === 0) {
     return { items: [], summary };
   }
-
-  const persisted = await insertShoppingListRows(supabase, rows);
 
   const computedByName = new Map(
     computed.map((item) => [
@@ -288,8 +297,24 @@ export async function regenerateShoppingList(): Promise<ShoppingListResult> {
     ])
   );
 
+  type PersistedRegenerateRow = {
+    id: string;
+    ingredient_name: string;
+    quantity: number | null;
+    unit: string | null;
+    category: string;
+    checked: boolean;
+    needed_for_meals: number | null;
+    shortage_label: string | null;
+    demand_quantity: number | null;
+    demand_unit: string | null;
+    pantry_quantity: number | null;
+    pantry_unit: string | null;
+    used_by_meals: string[] | null;
+  };
+
   return {
-    items: (persisted ?? []).map((item) => {
+    items: ((persisted ?? []) as PersistedRegenerateRow[]).map((item) => {
       const meta = computedByName.get(
         normalizeIngredientForMatch(item.ingredient_name)
       );

@@ -119,7 +119,7 @@ Called on the server (page or Server Action), it:
 | `countCookableRecipes()` | Dashboard — counts cookable recipes |
 | `rankRecipes()` | Meal suggestions — expiry-aware recipe ranking |
 | `ingredientInPantry()` | "Add Missing Ingredients" — determines which ingredients to add |
-| `consumePantryForCookedMeal()` | Cooking completion — matches ingredients to pantry rows for deduction |
+| `planCookedMealConsumption()` | Cooking completion — matches ingredients to pantry rows to plan deductions (persisted atomically via the `complete_cooked_meal` RPC) |
 
 ---
 

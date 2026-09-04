@@ -1034,11 +1034,10 @@ Each shopping row includes: `ingredient_name`, `quantity` (= shortage), `unit`, 
 2. Builds `FoodResolver` from all relevant ingredient names.
 3. Computes new list via `computeShoppingList()`.
 4. Preserves manual items (`source = 'manual'`) that are not in the pantry and not covered by the computed list.
-5. **Deletes all current user shopping rows** (delete-and-reinsert pattern).
-6. Inserts recomputed rows + preserved manual rows via `insertShoppingListRows()`.
-7. Returns the persisted list.
+5. Builds the final row set (recomputed rows + preserved manual rows) and passes it to the `regenerate_shopping_list(rows)` RPC, which **deletes all of the user's rows and inserts the new set in one transaction** (migration 015, [ADR-009](./adr/ADR-009-transactional-write-patterns.md) Task 2).
+6. Maps and returns the persisted list.
 
-The delete-and-reinsert pattern is intentional: it prevents stale rows from accumulating when meal plans change. The trade-off is that concurrent Add Missing actions during regeneration could be lost. This is an accepted limitation at current scale.
+The delete-then-insert is intentional: it prevents stale rows from accumulating when meal plans change. Since migration 015 it runs inside a single transaction, so an insert failure rolls back the delete rather than leaving the list empty. A residual *cross-request* concern remains (a concurrent Add Missing interleaving with a full regeneration); optimistic-concurrency version checks are tracked as future work under ADR-009 rather than as an accepted data-loss risk.
 
 ### 9.4 Recipe-Level "Add Missing"
 
@@ -1295,26 +1294,27 @@ User confirms
   ↓
 completeCookedMeal() server action
   ↓
-consumePantryForCookedMeal() (canonical pantry consumption engine)
+planCookedMealConsumption() (computes deductions + observations, no writes)
   ↓
-cooking_behavior_observations INSERT (anonymous learning)
+complete_cooked_meal() RPC — pantry UPDATE/DELETE + cooking_behavior_observations INSERT (one transaction)
   ↓
-triggerShoppingListRegeneration() (shopping recalculates)
+triggerShoppingListRegeneration() (shopping recalculates; non-fatal)
 ```
 
 ### 13.3 Canonical Pantry Consumption Engine
 
-`consumePantryForCookedMeal()` in `src/lib/pantry-consumption.ts`:
+`planCookedMealConsumption()` in `src/lib/pantry-consumption.ts` computes the consumption plan **in memory, performing no writes** (renamed from the earlier `consumePantryForCookedMeal()`, which both computed and wrote):
 
 1. Fetches all user pantry rows ordered by `expiry_date` ascending (FIFO — uses items expiring soonest first).
 2. Builds `FoodResolver` for all ingredient names involved.
 3. For each `CookingUsageInput`:
-   - If `actualQuantity <= 0`: records as "skipped", no pantry change.
+   - If `actualQuantity <= 0`: records as "skipped", no deduction.
    - Finds all pantry rows that `foodsMatch()` the ingredient AND have compatible units.
-   - Deducts `actualQuantity` across matching rows in expiry order (FIFO).
-   - Deletes rows where quantity reaches 0.
-   - Updates rows with remaining quantity.
-4. Inserts all observations into `cooking_behavior_observations`.
+   - Plans deductions across matching rows in expiry order (FIFO), against an in-memory snapshot so later ingredients see earlier ones' effect.
+   - Emits a deduction with `action: "delete"` where quantity reaches 0, otherwise `action: "update"` with the remaining quantity.
+4. Builds the observation rows for `cooking_behavior_observations`.
+
+`completeCookedMeal()` then passes the returned `{ deductions, observations }` to the `complete_cooked_meal` RPC (migration 015, [ADR-009](./adr/ADR-009-transactional-write-patterns.md) Task 5), which applies the pantry updates/deletes and the observation inserts in **one transaction** — partial cooking completion (pantry changed but observations lost, or vice versa) is no longer possible.
 
 The FIFO deduction logic is significant: if a user has `Milk (500ml, expires Jan 10)` and `Milk (1L, expires Jan 20)`, consuming 600ml will fully consume the first row and partially consume the second. This minimises food waste by preferring the item closest to expiry.
 
@@ -1454,7 +1454,7 @@ The substring fallback (4-character minimum) handles common cases like "Chicken 
 | Shopping list demand | `computeShoppingList()` | Demand grouping AND pantry supply check |
 | Shopping regeneration | `regenerateShoppingList()`, `collectManualItemsToPreserve()` | Manual item preservation |
 | Add Missing (recipe) | `addMissingIngredientsToShoppingList()` | Pantry presence check |
-| Pantry consumption | `consumePantryForCookedMeal()` | Which pantry rows to deduct from |
+| Pantry consumption | `planCookedMealConsumption()` | Which pantry rows to deduct from |
 | Meal suggestions | `getCatalogueMealSuggestions()`, `suggestMeals()` | Recipe ranking for AI meals page |
 | Dashboard | `getDashboardHomeData()` | Recipe count and recommendation |
 
@@ -1534,7 +1534,7 @@ A significant portion of the ShelfLife v2 development effort was spent consolida
 | Shopping row insertion | `insertShoppingListRows()` in `shopping-list-persistence.ts` | Duplicate direct inserts in shopping.ts and shopping-list.ts |
 | "Add Missing" decision logic | `planMissingIngredientsForShoppingList()` in `add-missing-ingredients-core.mjs` | Multiple independent implementations |
 | Pantry write | `insertOrStackPantryItem()` in `pantry-stacking.ts` | Direct inserts in pantry.ts and receipt.ts |
-| Pantry consumption | `consumePantryForCookedMeal()` in `pantry-consumption.ts` | Direct delete in meals.ts |
+| Pantry consumption | `planCookedMealConsumption()` in `pantry-consumption.ts` (persisted atomically via `complete_cooked_meal` RPC) | Direct delete in meals.ts |
 | Semantic matching | `foodsMatch()` / `matchesAnyPantry()` in `semantic-match.ts` | String matching in recipe-match, shopping, meals |
 | Cooking confirmation UI | `CookingConfirmationModal` | Separate handlers in MealCard and RecipeDetailModal |
 | Ingredient input UI | `IngredientFields` | Separate form implementations in add and receipt review |
@@ -1643,7 +1643,7 @@ Shared cooking confirmation flow used by `RecipeDetailModal` and `MealCard`. Pop
 |---|---|---|---|
 | `getCatalogueMealSuggestions` | — | `SuggestMealsResult` | None (computation only) |
 | `suggestMeals` | — | `SuggestMealsResult` | Gemini API call |
-| `completeCookedMeal` | `CompleteCookedMealInput` | `CookMealResult` | consumePantryForCookedMeal; trigger shopping regen |
+| `completeCookedMeal` | `CompleteCookedMealInput` | `CookMealResult` | planCookedMealConsumption → complete_cooked_meal RPC (atomic pantry deduction + observations); trigger shopping regen |
 | `cookMeal` | ingredientsUsed: string[] | `CookMealResult` | Wrapper for completeCookedMeal |
 | `saveMeal` | meal details | `SaveMealResult` | Insert into meals_saved |
 | `removeSavedMeal` | id | `SaveMealResult` | Delete from meals_saved |
@@ -1743,11 +1743,10 @@ This approach tests architecture decisions, not just output values, which is app
 
 The following areas lack test coverage:
 
-- Database migrations (no integration tests against a live Postgres instance)
-- Supabase RLS policies (not tested outside the live database)
+- Supabase RLS policies (not exercised beyond the transactional-RPC fault-injection suite; per-table policy coverage is still absent)
 - Gemini AI calls (not mocked; no unit tests for prompt quality)
 - `buildFoodResolver()` (requires database)
-- `consumePantryForCookedMeal()` (requires database)
+- `planCookedMealConsumption()` (requires database)
 - `insertOrStackPantryItem()` (requires database)
 - All server actions (require database and authentication)
 - All React components (no component tests)
@@ -1880,7 +1879,7 @@ The `/api/scan-receipt` route:
 ### 20.6 Known Security Considerations
 
 1. The `NEXT_PUBLIC_SUPABASE_ANON_KEY` is the Supabase anonymous key. It is designed to be public. Security relies on RLS policies at the database level.
-2. The delete-and-reinsert pattern in `regenerateShoppingList()` is not transactional at the application level. A server failure between the DELETE and INSERT could leave the shopping list empty. This is an acceptable risk at current scale.
+2. Shopping-list regeneration is transactional. `regenerateShoppingList()` computes the row set in TypeScript and persists it through the `regenerate_shopping_list` RPC (migration 015, [ADR-009](./adr/ADR-009-transactional-write-patterns.md)), which performs the DELETE and INSERT in one PostgreSQL transaction. A failure mid-write rolls back, so the list can no longer be left empty. On RPC failure the action logs the raw error server-side and returns a generic, user-safe message rather than the raw Postgres/PostgREST error.
 3. SUPER_ADMIN bootstrap requires direct database access. There is no UI for the first SUPER_ADMIN assignment.
 
 ---
@@ -1937,8 +1936,8 @@ Shopping list data is persisted to `shopping_list_items`. The `/shopping` page c
 **Saved Meals:**
 - Saved meals store a snapshot of `ingredients_used` / `missing_ingredients` at save time. This means the "Saved Meals" page shows stale information if the pantry has changed since saving. A live re-match against the current pantry is the correct architecture.
 
-**Shopping list regeneration race condition:**
-- The delete-and-reinsert pattern is not atomic. A concurrent Add Missing action during regeneration could have its rows deleted. This is a low-frequency risk at current scale but would require a transaction or a lock to fix properly.
+**Shopping list regeneration atomicity:**
+- Resolved for the delete/insert step by migration 015 ([ADR-009](./adr/ADR-009-transactional-write-patterns.md)): `regenerate_shopping_list` performs the delete-all + insert as one transaction, so a partial write can no longer leave the list empty. A residual, deferred concern remains for *cross-request* concurrency (a concurrent Add Missing interleaving with a regeneration); optimistic-concurrency version checks are noted as future work under ADR-009 and Household Sharing rather than an accepted data-loss risk.
 
 **Unit conversion:**
 - `unitsAreCompatible()` normalises `l/liter/liters → litre`, `tablespoon/tablespoons → tbsp`, etc. but does not perform scale conversion. 500ml in the pantry and a demand for 0.5l will compare as equal (same unit after normalisation) but 500ml and 0.5L with different capitalisation edge cases may not. Full unit conversion (e.g. 1000ml = 1L, 1kg = 1000g) is not implemented.
@@ -1960,7 +1959,7 @@ Shopping list data is persisted to `shopping_list_items`. The `/shopping` page c
 
 - **Saved meals live re-match**: requires fetching pantry at read time and re-running `matchRecipeToPantry()`. The `SavedMeal` type would need to carry original recipe data, not just ingredient snapshots.
 - **Dynamic community recipes**: the static catalogue limits the recipe engine. Replacing with a database-backed recipe system would enable community recipe contributions.
-- **Test infrastructure**: the current test suite covers architectural invariants well but has no database integration tests. A test Supabase project or a local Supabase instance with Docker would enable RLS and RPC testing.
+- **Test infrastructure**: unit tests (`npm test`, `tests/*.test.mjs`) cover architectural invariants and pure logic without a database. Database integration tests now exist as a fault-injection suite (`tests-integration/fault-injection.test.mjs`, `npm run test:fault-injection`) that runs against a real local Supabase Postgres and asserts each ADR-009 RPC rolls back atomically. The CI `migrations` job (`.github/workflows/ci.yml`) runs a clean `supabase db reset` (001→latest) followed by that suite on every PR. Broader RLS-policy coverage per table is still a future addition.
 
 ---
 
@@ -2066,7 +2065,7 @@ The v2 development cycle focused on correctness and architectural consolidation.
 - `insertOrStackPantryItem()` — single pantry write function
 - `planMissingIngredientsForShoppingList()` — single Add Missing decision function
 - `insertShoppingListRows()` — single shopping insertion function
-- `consumePantryForCookedMeal()` — single pantry consumption function with FIFO deduction and behaviour observations
+- `planCookedMealConsumption()` — single pantry consumption planner with FIFO deduction and behaviour observations (persisted atomically by the `complete_cooked_meal` RPC)
 
 **Cooking Engine V2 (Migration 011):**
 - `CookingConfirmationModal` — quantity-aware cooking confirmation UI
@@ -2216,8 +2215,7 @@ graph TD
     BuildResolver["buildFoodResolver()<br/>(batch RPC)"]
     ComputeList["computeShoppingList()<br/>(demand aggregation,<br/>pantry supply comparison)"]
     PreserveManual["collectManualItemsToPreserve()<br/>(keep non-meal-plan items)"]
-    DeleteAll["DELETE shopping_list_items"]
-    InsertRows["insertShoppingListRows()<br/>(computed + manual)"]
+    RegenRpc["regenerate_shopping_list(rows) RPC<br/>(DELETE-all + INSERT in one transaction)"]
     Persist["shopping_list_items<br/>(with demand details)"]
 
     PantryChange --> Trigger
@@ -2229,9 +2227,8 @@ graph TD
     FetchExisting --> BuildResolver
     BuildResolver --> ComputeList
     ComputeList --> PreserveManual
-    PreserveManual --> DeleteAll
-    DeleteAll --> InsertRows
-    InsertRows --> Persist
+    PreserveManual --> RegenRpc
+    RegenRpc --> Persist
 ```
 
 ### A.6 Shopping Demand Formula
@@ -2289,7 +2286,7 @@ sequenceDiagram
     participant U as User
     participant Modal as CookingConfirmationModal
     participant SA as completeCookedMeal()
-    participant CE as consumePantryForCookedMeal()
+    participant CE as planCookedMealConsumption()
     participant DB as Supabase PostgreSQL
 
     U->>Modal: Click "Mark as cooked"
@@ -2297,16 +2294,14 @@ sequenceDiagram
     U->>Modal: Edit quantities (optional)
     U->>Modal: Confirm
     Modal->>SA: completeCookedMeal({ ingredients })
-    SA->>CE: consumePantryForCookedMeal(userId, ingredients)
+    SA->>CE: planCookedMealConsumption(userId, ingredients)
     CE->>DB: SELECT pantry ORDER BY expiry_date ASC
     CE->>DB: buildFoodResolver (batch RPC)
-    loop For each ingredient
-        CE->>DB: FIFO deduction across matching pantry rows
-        CE->>DB: DELETE row if quantity reaches 0
-        CE->>DB: UPDATE row with remaining quantity
-    end
-    CE->>DB: INSERT cooking_behavior_observations
-    SA->>DB: triggerShoppingListRegeneration()
+    Note over CE: Compute deductions + observations in memory (no writes)
+    CE-->>SA: { deductions, observations }
+    SA->>DB: complete_cooked_meal(deductions, observations) RPC
+    Note over DB: pantry UPDATE/DELETE + observations INSERT (one transaction)
+    SA->>DB: triggerShoppingListRegeneration() (non-fatal)
     SA-->>Modal: { success: true }
     Modal->>U: Close modal
 ```
