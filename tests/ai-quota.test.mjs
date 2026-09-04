@@ -18,6 +18,7 @@ import {
   AI_FEATURE_KEYS,
   FREE_TIER_AI_LIMITS,
   formatRetryAfter,
+  isDateBinCompatibleWindow,
   mapQuotaRpcResponse,
 } from "../src/lib/ai-quota-core.mjs";
 
@@ -150,6 +151,113 @@ test("mapQuotaRpcResponse: fails open when the RPC returns no usable row", () =>
   assert.equal(nullData.reason, "empty_row");
 });
 
+// ---------------------------------------------------------------------------
+// FF-1: a present-but-malformed row fails OPEN (like any other malformed
+// response), not closed. Before this fix, a row missing `allowed` (e.g.
+// `{}`) fell through to `!row.allowed` and was misread as a real deny.
+// ---------------------------------------------------------------------------
+
+test("mapQuotaRpcResponse (FF-1): a row missing `allowed` fails open, not closed", () => {
+  const missingField = mapQuotaRpcResponse({ data: { current_count: 1 }, error: null }, 20);
+  assert.equal(missingField.allowed, true, "a malformed row must never be read as a real deny");
+  assert.equal(missingField.failedOpen, true);
+  assert.equal(missingField.reason, "malformed_row");
+});
+
+test("mapQuotaRpcResponse (FF-1): a row with a non-boolean `allowed` fails open", () => {
+  for (const badValue of [undefined, null, 0, "", "true", 1]) {
+    const result = mapQuotaRpcResponse({ data: { allowed: badValue }, error: null }, 20);
+    assert.equal(
+      result.allowed,
+      true,
+      `allowed: ${JSON.stringify(badValue)} is malformed input, not a real deny — must fail open`
+    );
+    assert.equal(result.failedOpen, true);
+    assert.equal(result.reason, "malformed_row");
+  }
+});
+
+test("mapQuotaRpcResponse (FF-1): a real `allowed === false` on a well-formed row still denies", () => {
+  const result = mapQuotaRpcResponse(
+    { data: { allowed: false, retry_after_seconds: 120, quota_limit: 20 }, error: null },
+    20
+  );
+  assert.deepEqual(result, { allowed: false, retryAfterSeconds: 120, limit: 20 });
+});
+
+// ---------------------------------------------------------------------------
+// FF-2: an auth-class RPC error fails CLOSED (never grants an
+// unauthenticated caller a free AI call via the Rule #6 fail-open path),
+// while a genuine transient/infra error still fails open.
+// ---------------------------------------------------------------------------
+
+test("mapQuotaRpcResponse (FF-2): a permission-denied (42501) error — an anonymous caller rejected by PostgREST's GRANT — fails closed", () => {
+  const permissionDenied = {
+    code: "42501",
+    message: 'permission denied for function check_and_consume_ai_quota',
+  };
+  const result = mapQuotaRpcResponse({ data: null, error: permissionDenied }, 20);
+  assert.equal(result.allowed, false, "an unauthenticated caller must be denied, never fail open");
+  assert.equal(result.authDenied, true);
+  assert.notEqual(result.failedOpen, true, "an auth-class denial is not the generic fail-open path");
+});
+
+test("mapQuotaRpcResponse (FF-2): the RPC's own \"Not authenticated\" auth.uid() guard also fails closed", () => {
+  const notAuthenticated = { message: "Not authenticated" };
+  const result = mapQuotaRpcResponse({ data: null, error: notAuthenticated }, 20);
+  assert.equal(result.allowed, false);
+  assert.equal(result.authDenied, true);
+});
+
+test("mapQuotaRpcResponse (FF-2): a real transient/infra RPC error is NOT treated as auth-class and still fails open (Rule #6)", () => {
+  const timeout = { code: "ETIMEDOUT", message: "connection timeout" };
+  const result = mapQuotaRpcResponse({ data: null, error: timeout }, 20);
+  assert.equal(result.allowed, true, "a genuine infra failure must still fail open per Rule #6");
+  assert.equal(result.failedOpen, true);
+  assert.equal(result.reason, "rpc_error");
+  assert.notEqual(
+    result.authDenied,
+    true,
+    "a transient error must not be misclassified as an auth-class denial"
+  );
+});
+
+test("mapQuotaRpcResponse (FF-2): an unrelated error whose message happens to contain other words is not misclassified as auth-class", () => {
+  const unrelated = { message: "duplicate key value violates unique constraint" };
+  const result = mapQuotaRpcResponse({ data: null, error: unrelated }, 20);
+  assert.equal(result.allowed, true);
+  assert.equal(result.failedOpen, true);
+  assert.notEqual(result.authDenied, true);
+});
+
+// ---------------------------------------------------------------------------
+// N-2: every configured window must be date_bin-compatible (no month/year
+// components — Postgres rejects those strides outright).
+// ---------------------------------------------------------------------------
+
+test("isDateBinCompatibleWindow (N-2): rejects month/year strides and accepts day/hour/minute/second strides", () => {
+  // Prove the check actually catches a bad window, not just rubber-stamping.
+  assert.equal(isDateBinCompatibleWindow("1 month"), false);
+  assert.equal(isDateBinCompatibleWindow("1 year"), false);
+  assert.equal(isDateBinCompatibleWindow("2 months 3 days"), false);
+  assert.equal(isDateBinCompatibleWindow("1 YEAR"), false, "must be case-insensitive");
+
+  assert.equal(isDateBinCompatibleWindow("1 day"), true);
+  assert.equal(isDateBinCompatibleWindow("12 hours"), true);
+  assert.equal(isDateBinCompatibleWindow("30 minutes"), true);
+  assert.equal(isDateBinCompatibleWindow("1 week"), true);
+});
+
+test("every FREE_TIER_AI_LIMITS window is date_bin-compatible (N-2 config guard)", () => {
+  for (const key of Object.values(AI_FEATURE_KEYS)) {
+    const config = FREE_TIER_AI_LIMITS[key];
+    assert.ok(
+      isDateBinCompatibleWindow(config.window),
+      `"${config.window}" for "${key}" would break date_bin at the RPC (month/year strides are rejected by Postgres)`
+    );
+  }
+});
+
 test("formatRetryAfter: renders short, medium, and long windows sensibly", () => {
   assert.equal(formatRetryAfter(30), "in a minute");
   assert.equal(formatRetryAfter(90), "in about 2 minutes");
@@ -171,12 +279,44 @@ test("free-tier limit config covers exactly the three ADR-010 feature keys, with
   }
 });
 
+/**
+ * FF-2's "auth precedes quota" invariant: every AI entry point must resolve
+ * the caller's identity — via an explicit `auth.getUser()` call, the shared
+ * `getAuthenticatedUser()` helper (planner.ts), or `getPantryForMeals()`
+ * (meals.ts), which itself calls `auth.getUser()` and redirects an
+ * unauthenticated caller before ever returning — strictly before calling
+ * `consumeAiQuota(`. This is defense-in-depth alongside FF-2's RPC-level
+ * auth-class fail-closed behaviour (see ai-quota-core.mjs): no entry point
+ * should ever be relying on the quota RPC as its *only* authentication
+ * gate. This test fails if a future entry point (or a refactor of an
+ * existing one) calls consumeAiQuota before any of these markers appear.
+ */
+function assertAuthResolvedBeforeQuota(body, label) {
+  const quotaIndex = body.indexOf("consumeAiQuota(");
+  assert.notEqual(quotaIndex, -1, `${label} should call consumeAiQuota`);
+
+  const authMarkers = ["auth.getUser(", "getAuthenticatedUser(", "getPantryForMeals("];
+  const authIndexes = authMarkers
+    .map((marker) => body.indexOf(marker))
+    .filter((index) => index !== -1);
+
+  assert.ok(
+    authIndexes.length > 0,
+    `${label} must resolve the caller's identity (auth.getUser() / getAuthenticatedUser() / getPantryForMeals()) somewhere in its body before consuming quota`
+  );
+  assert.ok(
+    Math.min(...authIndexes) < quotaIndex,
+    `${label} must authenticate the caller before calling consumeAiQuota — never let the quota RPC be the only auth gate`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 2. Architectural checks: every current Gemini entry point is guarded
 // ---------------------------------------------------------------------------
 
 test("receipt scan route consumes receipt_scan quota before any Gemini call", () => {
   const postBody = exportedFunctionBody(scanReceiptRoute, "POST");
+  assertAuthResolvedBeforeQuota(postBody, "POST /api/scan-receipt");
   assertQuotaCheckedBeforeGemini(postBody, "POST /api/scan-receipt");
   assert.match(
     postBody,
@@ -187,6 +327,7 @@ test("receipt scan route consumes receipt_scan quota before any Gemini call", ()
 
 test("meal planning (generateMealPlan and replaceMealPlanItem) consumes meal_plan quota before any Gemini call", () => {
   const generateBody = exportedFunctionBody(plannerAction, "generateMealPlan");
+  assertAuthResolvedBeforeQuota(generateBody, "generateMealPlan");
   assertQuotaCheckedBeforeGemini(generateBody, "generateMealPlan");
   assert.match(
     generateBody,
@@ -194,6 +335,7 @@ test("meal planning (generateMealPlan and replaceMealPlanItem) consumes meal_pla
   );
 
   const replaceBody = exportedFunctionBody(plannerAction, "replaceMealPlanItem");
+  assertAuthResolvedBeforeQuota(replaceBody, "replaceMealPlanItem");
   assertQuotaCheckedBeforeGemini(replaceBody, "replaceMealPlanItem");
   assert.match(
     replaceBody,
@@ -204,6 +346,7 @@ test("meal planning (generateMealPlan and replaceMealPlanItem) consumes meal_pla
 
 test("meal suggestions (suggestMeals) consumes meal_parse quota before any Gemini call", () => {
   const suggestBody = exportedFunctionBody(mealsAction, "suggestMeals");
+  assertAuthResolvedBeforeQuota(suggestBody, "suggestMeals");
   assertQuotaCheckedBeforeGemini(suggestBody, "suggestMeals");
   assert.match(
     suggestBody,
@@ -214,6 +357,29 @@ test("meal suggestions (suggestMeals) consumes meal_parse quota before any Gemin
   // quota-free — it would be a real bug for it to consume budget.
   const catalogueBody = exportedFunctionBody(mealsAction, "getCatalogueMealSuggestions");
   assert.doesNotMatch(catalogueBody, /consumeAiQuota|GoogleGenerativeAI/);
+});
+
+test("FF-2 invariant is not vacuous: an entry point calling consumeAiQuota before authenticating would fail", () => {
+  const unauthenticatedFirst = `
+    export async function fakeEntryPoint() {
+      const quota = await consumeAiQuota(supabase, AI_FEATURE_KEYS.MEAL_PARSE);
+      const { data: { user } } = await supabase.auth.getUser();
+    }
+  `;
+  assert.throws(
+    () => assertAuthResolvedBeforeQuota(unauthenticatedFirst, "fakeEntryPoint"),
+    /must authenticate the caller before calling consumeAiQuota/
+  );
+
+  const noAuthAtAll = `
+    export async function fakeEntryPoint() {
+      const quota = await consumeAiQuota(supabase, AI_FEATURE_KEYS.MEAL_PARSE);
+    }
+  `;
+  assert.throws(
+    () => assertAuthResolvedBeforeQuota(noAuthAtAll, "fakeEntryPoint"),
+    /must resolve the caller's identity/
+  );
 });
 
 test("consumeAiQuota fails open and logs loudly when the RPC call errors (ADR-010 Rule #6)", () => {

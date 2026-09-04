@@ -53,6 +53,19 @@ export async function consumeAiQuota(
   }
 
   if (!decision.allowed) {
+    if (decision.authDenied) {
+      // FF-2: this is not a real quota exhaustion — it means the RPC
+      // reported the caller as unauthenticated. That should never happen
+      // this deep in, given every entry point resolves the caller's
+      // identity before calling consumeAiQuota(); logging loudly (same
+      // spirit as the Rule #6 fail-open branch above) surfaces it as the
+      // anomaly it is rather than silently blending into ordinary
+      // over-limit denials.
+      console.error(
+        `[consumeAiQuota] check_and_consume_ai_quota reported an auth-class failure for feature "${feature}" — denying the AI call (ADR-010 FF-2: auth-class failures fail closed, never fail open).`
+      );
+    }
+
     return {
       allowed: false,
       retryAfterSeconds: decision.retryAfterSeconds,
