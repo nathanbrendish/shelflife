@@ -54,13 +54,16 @@ export const FREE_TIER_AI_LIMITS = {
  *    bypasses PostgREST's role grants). A plain `RAISE EXCEPTION 'text'`
  *    with no `USING ERRCODE` always reports the generic SQLSTATE `P0001`
  *    — shared by every other RAISE EXCEPTION in this function (invalid
- *    feature/limit/window) — so SQLSTATE alone can't distinguish it.
- *    Message-text matching is the only signal available without editing
+ *    feature/limit/window) — so SQLSTATE alone can't distinguish it. Exact
+ *    message-text equality is the only signal available without editing
  *    the RPC, and migration 016 is already deployed (ADR-008 immutability
  *    rules out editing it here). This is a deliberate, narrow coupling to
- *    that exact string: if the RPC's wording ever changes, this specific
- *    defense-in-depth case silently reverts to fail-open — the `42501`
- *    path above is unaffected and remains robust regardless.
+ *    that exact string — checked with `===`, not a substring/`.includes()`
+ *    match, so an unrelated error that merely mentions "Not authenticated"
+ *    inside a longer message is never misclassified: if the RPC's wording
+ *    ever changes, this specific defense-in-depth case silently reverts to
+ *    fail-open — the `42501` path above is unaffected and remains robust
+ *    regardless.
  *
  * @param {unknown} error
  */
@@ -73,7 +76,7 @@ function isAuthClassError(error) {
     return true;
   }
 
-  return typeof error.message === "string" && error.message.includes("Not authenticated");
+  return error.message === "Not authenticated";
 }
 
 /**
@@ -82,15 +85,27 @@ function isAuthClassError(error) {
  * interval containing a month or year component; Postgres raises
  * "timestamps cannot be binned into intervals containing months or years"
  * for those. Every configured window must therefore be expressible in
- * days/hours/minutes/seconds only. This is a conservative config-validation
- * guard (rejects on the words "month"/"year" appearing at all, not a full
- * interval parser) so a future limit like "1 month" is caught here, in a
- * cheap unit test, long before it ever reaches the RPC in production.
+ * days/hours/minutes/seconds only.
+ *
+ * This is a heuristic config-validation guard, NOT a full Postgres interval
+ * parser: it rejects the written-out words ("month"/"year", singular or
+ * plural) and their common abbreviations ("mon"/"mons", "y"/"yr"/"yrs"),
+ * including Postgres's no-space digit-unit form (e.g. "1mon", "3y") — the
+ * lookbehind/lookahead below use "not preceded/followed by a letter" rather
+ * than `\b`, since `\b` never fires between a digit and a letter, and
+ * Postgres accepts interval literals with no space between the two. It is
+ * NOT exhaustive against every interval spelling Postgres accepts (e.g.
+ * ISO 8601 duration syntax); it exists to catch what a developer would
+ * plausibly type into `FREE_TIER_AI_LIMITS`, cheaply, in a unit test, long
+ * before it ever reaches the RPC in production.
  *
  * @param {unknown} window
  */
 export function isDateBinCompatibleWindow(window) {
-  return typeof window === "string" && !/\b(month|year)s?\b/i.test(window);
+  return (
+    typeof window === "string" &&
+    !/(?<![a-z])(years?|yrs?|y|months?|mons?)(?![a-z])/i.test(window)
+  );
 }
 
 /**

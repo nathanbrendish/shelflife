@@ -230,22 +230,62 @@ test("mapQuotaRpcResponse (FF-2): an unrelated error whose message happens to co
   assert.notEqual(result.authDenied, true);
 });
 
+test("mapQuotaRpcResponse (FF-2 nit): message-text matching is exact equality, not a substring check", () => {
+  // Proves the `.includes()` -> `===` tightening actually took effect: a
+  // message that merely CONTAINS "Not authenticated" inside unrelated text
+  // (e.g. an RLS error quoting it) must NOT be misclassified as the RPC's
+  // own auth.uid() guard failure — it falls through to the generic
+  // transient/infra fail-open path instead.
+  const containsButNotEqual = {
+    message: "Not authenticated to view this row (RLS policy violation)",
+  };
+  const result = mapQuotaRpcResponse({ data: null, error: containsButNotEqual }, 20);
+  assert.equal(
+    result.allowed,
+    true,
+    "a message that only contains the auth-guard text, but isn't an exact match, must fail open, not closed"
+  );
+  assert.equal(result.failedOpen, true);
+  assert.notEqual(result.authDenied, true);
+
+  // The exact string still matches (unchanged behaviour).
+  const exact = mapQuotaRpcResponse({ data: null, error: { message: "Not authenticated" } }, 20);
+  assert.equal(exact.allowed, false);
+  assert.equal(exact.authDenied, true);
+});
+
 // ---------------------------------------------------------------------------
 // N-2: every configured window must be date_bin-compatible (no month/year
 // components — Postgres rejects those strides outright).
 // ---------------------------------------------------------------------------
 
-test("isDateBinCompatibleWindow (N-2): rejects month/year strides and accepts day/hour/minute/second strides", () => {
+test("isDateBinCompatibleWindow (N-2): rejects month/year strides (written-out and abbreviated) and accepts day/hour/minute/second strides", () => {
   // Prove the check actually catches a bad window, not just rubber-stamping.
   assert.equal(isDateBinCompatibleWindow("1 month"), false);
   assert.equal(isDateBinCompatibleWindow("1 year"), false);
   assert.equal(isDateBinCompatibleWindow("2 months 3 days"), false);
   assert.equal(isDateBinCompatibleWindow("1 YEAR"), false, "must be case-insensitive");
 
+  // Postgres's abbreviated interval spellings — a bare word check misses
+  // these unless it also handles the no-space digit-unit form.
+  assert.equal(isDateBinCompatibleWindow("1 mon"), false);
+  assert.equal(isDateBinCompatibleWindow("2 mons"), false);
+  assert.equal(isDateBinCompatibleWindow("3 y"), false);
+  assert.equal(isDateBinCompatibleWindow("5 yr"), false);
+  assert.equal(isDateBinCompatibleWindow("5 yrs"), false);
+  assert.equal(isDateBinCompatibleWindow("1mon"), false, "no-space digit-unit form");
+  assert.equal(isDateBinCompatibleWindow("3y"), false, "no-space digit-unit form");
+  assert.equal(isDateBinCompatibleWindow("5yrs"), false, "no-space digit-unit form");
+
   assert.equal(isDateBinCompatibleWindow("1 day"), true);
   assert.equal(isDateBinCompatibleWindow("12 hours"), true);
   assert.equal(isDateBinCompatibleWindow("30 minutes"), true);
   assert.equal(isDateBinCompatibleWindow("1 week"), true);
+  assert.equal(isDateBinCompatibleWindow("7 days"), true);
+  // "day" ends in "y" and "may"-like words must not false-positive: the
+  // heuristic only fires when the unit token isn't itself glued to other
+  // letters (a preceding/following letter, as opposed to a digit or space).
+  assert.equal(isDateBinCompatibleWindow("1 day"), true, "must not false-positive on the trailing 'y' in 'day'");
 });
 
 test("every FREE_TIER_AI_LIMITS window is date_bin-compatible (N-2 config guard)", () => {
