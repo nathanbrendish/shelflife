@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
+import { AI_FEATURE_KEYS, consumeAiQuota } from "@/lib/ai-quota";
 import { getGeminiModelName } from "@/lib/gemini/config";
 import { mapGeminiError } from "@/lib/gemini/map-gemini-error";
 import { parseIngredientsResponse } from "@/lib/gemini/parse-ingredients";
@@ -193,6 +194,29 @@ export async function POST(request: Request) {
         error: validation.message,
         code: validation.code,
         retryable: false,
+        requestId,
+      });
+    }
+
+    // ADR-010 Rule #1: every AI provider call must be preceded by a
+    // successful quota consume. Checked after upload validation (so a
+    // rejected/malformed file never costs the user quota) but before any
+    // Gemini setup or call.
+    const quota = await consumeAiQuota(supabase, AI_FEATURE_KEYS.RECEIPT_SCAN);
+
+    if (!quota.allowed) {
+      logServerScanEvent("quota_exceeded", {
+        requestId,
+        userId: user.id,
+        retryAfterSeconds: quota.retryAfterSeconds,
+        limit: quota.limit,
+      });
+
+      return jsonError(429, {
+        error: SCAN_USER_MESSAGES.AI_BUSY,
+        code: SCAN_ERROR_CODES.AI_BUSY,
+        details: `Daily receipt scan limit reached. Retry after ${quota.retryAfterSeconds} seconds.`,
+        retryable: true,
         requestId,
       });
     }

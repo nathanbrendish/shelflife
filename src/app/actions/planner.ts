@@ -3,6 +3,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { AI_FEATURE_KEYS, consumeAiQuota, formatRetryAfter } from "@/lib/ai-quota";
 import { getGeminiModelName } from "@/lib/gemini/config";
 import { mapGeminiError } from "@/lib/gemini/map-gemini-error";
 import { parseMealPlanResponse } from "@/lib/gemini/parse-meal-plan";
@@ -113,6 +114,17 @@ export async function generateMealPlan(
       return {
         success: false,
         error: "Meal planner is not configured.",
+      };
+    }
+
+    // ADR-010 Rule #1: every AI provider call must be preceded by a
+    // successful quota consume.
+    const quota = await consumeAiQuota(supabase, AI_FEATURE_KEYS.MEAL_PLAN);
+
+    if (!quota.allowed) {
+      return {
+        success: false,
+        error: `You've reached today's meal planning limit. Please try again ${formatRetryAfter(quota.retryAfterSeconds)}.`,
       };
     }
 
@@ -274,6 +286,19 @@ export async function replaceMealPlanItem(
 
     if (!apiKey) {
       return { success: false, error: "Meal planner is not configured." };
+    }
+
+    // ADR-010 Rule #1: every AI provider call must be preceded by a
+    // successful quota consume. `replaceMealPlanItem` shares the
+    // `meal_plan` feature key with `generateMealPlan` — both are the
+    // "meal planning" entry point per ADR-010's Scope of Application.
+    const quota = await consumeAiQuota(supabase, AI_FEATURE_KEYS.MEAL_PLAN);
+
+    if (!quota.allowed) {
+      return {
+        success: false,
+        error: `You've reached today's meal planning limit. Please try again ${formatRetryAfter(quota.retryAfterSeconds)}.`,
+      };
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);

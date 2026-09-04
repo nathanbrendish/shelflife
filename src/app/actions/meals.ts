@@ -4,6 +4,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { triggerShoppingListRegeneration } from "@/app/actions/shopping";
+import { AI_FEATURE_KEYS, consumeAiQuota, formatRetryAfter } from "@/lib/ai-quota";
 import { getExpiryStatus } from "@/lib/expiry";
 import { getGeminiModelName } from "@/lib/gemini/config";
 import { mapGeminiError } from "@/lib/gemini/map-gemini-error";
@@ -223,13 +224,25 @@ export async function suggestMeals(): Promise<SuggestMealsResult> {
       };
     }
 
+    // ADR-010 Rule #1: every AI provider call must be preceded by a
+    // successful quota consume. Feature key `meal_parse` — this is the AI
+    // meal-suggestions/parsing entry point (distinct from meal planning).
+    const supabase = await createClient();
+    const quota = await consumeAiQuota(supabase, AI_FEATURE_KEYS.MEAL_PARSE);
+
+    if (!quota.allowed) {
+      return {
+        status: "error",
+        message: `You've reached today's meal suggestion limit. Please try again ${formatRetryAfter(quota.retryAfterSeconds)}.`,
+      };
+    }
+
     const pantryForRanking = ingredients.map((i) => ({
       ingredient_name: i.name,
       expiry_date: i.expiry_date,
     }));
 
     const catalogue = getAllRecipes();
-    const supabase = await createClient();
     const resolver = await buildFoodResolver(supabase, [
       ...catalogueIngredientNames(),
       ...ingredients.map((i) => i.name),
