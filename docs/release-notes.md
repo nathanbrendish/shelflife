@@ -23,6 +23,7 @@ All dates and commit references are derived from the git log. Version numbers re
 5. [Post-v2.0 Fixes](#5-post-v20-fixes)
 6. [Production Schema Reconciliation](#6-production-schema-reconciliation)
 7. [ADR-009 Phase 0 and Phase 1](#7-adr-009-phase-0-and-phase-1)
+8. [ADR-010 — AI Rate-Limiting and Usage Metering](#8-adr-010--ai-rate-limiting-and-usage-metering)
 
 ---
 
@@ -583,7 +584,7 @@ A second forensic audit, run after deployment, confirmed Development and Product
 ### Future Work
 
 - A dedicated migration to `DROP TABLE public.pantry_items` after explicit human review confirming no real user data is at risk.
-- A dedicated schema-cleanup migration (016 or later) to drop the deprecated free-text columns (`pantry.category`, `pantry.subcategory`, `community_foods.primary_category`/`secondary_category`, `community_food_votes.category`), now that both environments are confirmed to have converged on the same deprecated-but-present state.
+- A dedicated schema-cleanup migration (017 or later) to drop the deprecated free-text columns (`pantry.category`, `pantry.subcategory`, `community_foods.primary_category`/`secondary_category`, `community_food_votes.category`), now that both environments are confirmed to have converged on the same deprecated-but-present state.
 - Consider adding an automated, scheduled forensic schema comparison between Development and Production (rather than only running one manually at release time) to detect drift closer to when it happens.
 
 **Full technical detail:** [docs/database-schema.md § 11](./database-schema.md#11-production-schema-reconciliation-july-2026), [docs/architecture.md § 19.6](./architecture.md#196-production-schema-reconciliation-july-2026), [ADR-008](./adr/ADR-008-production-schema-reconciliation-strategy.md).
@@ -602,6 +603,18 @@ The receipt RPC also adds a database-enforced stacking identity (`pantry_user_ca
 Alongside the RPCs, the single-write `deleteIngredient` action was hardened to the ADR-009 error-contract rule (BUG-11): it now uses a counted delete, returns a safe `PantryFormState` (surfacing "not found" and failure inline via the new `DeleteIngredientButton` client component) instead of returning `void`, and only regenerates the shopping list once a row is confirmed removed.
 
 Phase 0 adds the repository CI workflow (`.github/workflows/ci.yml`), a clean migration-chain reset (`supabase db reset`, 001→latest), and a deterministic Supabase seed (`supabase/seed.sql`). Local environment variables are documented in [developer-onboarding.md § 6](./developer-onboarding.md#6-environment-variables) (the repository does not commit an `.env` template — `.env*` is git-ignored). Integration fault-injection tests (`tests-integration/fault-injection.test.mjs`, `npm run test:fault-injection`) verify transaction rollback and stacking-conflict behavior. See [ADR-009](./adr/ADR-009-transactional-write-patterns.md) and [database-schema.md § 5.6](./database-schema.md#56-transactional-write-boundaries).
+
+---
+
+## 8. ADR-010 — AI Rate-Limiting and Usage Metering
+
+**Deployed:** September 2026 (Development + Production)
+
+Migration 016 adds `ai_usage_counters`, the append-only `ai_usage_log`, and the atomic `check_and_consume_ai_quota` `SECURITY DEFINER` RPC. All four Gemini call sites—receipt scanning, meal suggestions, meal-plan generation, and meal replacement—now call `consumeAiQuota(...)` before invoking the provider.
+
+Free-tier fixed-window limits are centrally configured at 20 receipt scans, 10 meal-planning calls, and 20 meal-suggestion/parse calls per user per day. Allowed calls increment the counter and append a metering row; over-quota calls stop before Gemini and return a safe retry-after response. Quota infrastructure errors deliberately fail open with server-side error logging, as specified by [ADR-010](./adr/ADR-010-ai-rate-limiting-usage-metering.md).
+
+The feature is live on both hosted environments. Runtime verification of the quota-exceeded path remains tracked as RT-GAP in the [product roadmap](./product-roadmap.md#known-technical-debt).
 
 ---
 
@@ -624,3 +637,4 @@ Phase 0 adds the repository CI workflow (`.github/workflows/ci.yml`), a clean mi
 | 013 | Comprehensive additive Dev↔Prod schema reconciliation (10 tables, 16 columns, 15 functions, 1 trigger, 13 indexes) — see Section 6 |
 | 014 | Defensive hardening of migration 012's prerequisite dependency — see Section 6 |
 | 015 | ADR-009 transactional write RPCs, atomic receipt stacking, and `pantry_user_canonical_stack_idx` — see Section 7 |
+| 016 | AI rate-limiting + usage metering (ADR-010) |

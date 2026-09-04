@@ -4,7 +4,7 @@
 **Version:** 2.0  
 **Status:** Current  
 **Audience:** Engineers, database administrators, technical reviewers  
-**Last Updated:** July 2026  
+**Last Updated:** September 2026
 **See Also:** [docs/architecture.md](./architecture.md) — system design and data flow
 
 ---
@@ -29,6 +29,8 @@
    - 3.13 [platform\_roles](#313-platform_roles)
    - 3.14 [user\_roles](#314-user_roles)
    - 3.15 [cooking\_behavior\_observations](#315-cooking_behavior_observations)
+   - 3.16 [ai\_usage\_counters](#316-ai_usage_counters)
+   - 3.17 [ai\_usage\_log](#317-ai_usage_log)
 4. [Supabase Auth](#4-supabase-auth)
 5. [RPC Functions](#5-rpc-functions)
 6. [Triggers](#6-triggers)
@@ -75,8 +77,12 @@ auth.users (Supabase managed)
   │
   ├──< shopping_list_items (user_id)
   │
-  └──< user_roles (user_id)
-        └──> platform_roles (role)
+  ├──< user_roles (user_id)
+  │     └──> platform_roles (role)
+  │
+  ├──< ai_usage_counters (user_id)
+  │
+  └──< ai_usage_log (user_id)
 
 community_foods (autonomous — no user_id)
   ├──> food_categories (food_category_id)
@@ -681,6 +687,61 @@ Authenticated users do not have direct `SELECT` or `INSERT` access. Contribution
 
 ---
 
+### 3.16 `ai_usage_counters`
+
+**Purpose:** Atomic per-user, per-feature fixed-window counters used to enforce ADR-010 AI quotas.
+
+**Introduced:** Migration 016
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `user_id` | uuid | NOT NULL | — | FK → `auth.users(id)` ON DELETE CASCADE; composite PK |
+| `feature` | text | NOT NULL | — | Feature key such as `receipt_scan`, `meal_plan`, or `meal_parse`; composite PK |
+| `window_start` | timestamptz | NOT NULL | — | Fixed-window bucket start; composite PK |
+| `request_count` | integer | NOT NULL | `0` | Atomically incremented for every quota check, including denied attempts |
+| `updated_at` | timestamptz | NOT NULL | `now()` | Last counter update |
+
+- **Primary Key:** `(user_id, feature, window_start)`
+- **Foreign Key:** `user_id` → `auth.users(id)` ON DELETE CASCADE
+
+**RLS Policies:**
+| Policy | Operation | Condition |
+|---|---|---|
+| Users can view their own AI usage counters | SELECT | `auth.uid() = user_id` |
+| Super admins can view all AI usage counters | SELECT | `is_super_admin()` |
+
+There are no client write policies. The sole writer is the `SECURITY DEFINER` `check_and_consume_ai_quota` RPC.
+
+---
+
+### 3.17 `ai_usage_log`
+
+**Purpose:** Append-only metering ledger for AI calls that passed quota enforcement and were allowed to reach Gemini.
+
+**Introduced:** Migration 016
+
+| Column | Type | Nullable | Default | Notes |
+|---|---|---|---|---|
+| `id` | uuid | NOT NULL | `gen_random_uuid()` | Primary key |
+| `user_id` | uuid | NOT NULL | — | FK → `auth.users(id)` ON DELETE CASCADE |
+| `feature` | text | NOT NULL | — | AI feature key |
+| `created_at` | timestamptz | NOT NULL | `now()` | Allowed-call timestamp |
+| `size_estimate` | integer | NULL | — | Reserved for future token/input-size metering; currently NULL |
+
+- **Primary Key:** `id`
+- **Foreign Key:** `user_id` → `auth.users(id)` ON DELETE CASCADE
+- **Index:** `ai_usage_log_user_feature_idx` ON `(user_id, feature, created_at)`
+
+**RLS Policies:**
+| Policy | Operation | Condition |
+|---|---|---|
+| Users can view their own AI usage log | SELECT | `auth.uid() = user_id` |
+| Super admins can view all AI usage log | SELECT | `is_super_admin()` |
+
+There are no client write policies. The sole writer is the `SECURITY DEFINER` `check_and_consume_ai_quota` RPC.
+
+---
+
 ## 4. Supabase Auth
 
 Supabase manages `auth.users` internally. The application does not have direct schema access.
@@ -778,6 +839,16 @@ Introduced by migration 015 under [ADR-009](./adr/ADR-009-transactional-write-pa
 
 ---
 
+### 5.7 AI Quota and Metering
+
+| Function | Signature | Returns | Purpose |
+|---|---|---|---|
+| `check_and_consume_ai_quota` | `(text, integer, interval)` | TABLE `(allowed, current_count, quota_limit, retry_after_seconds)` | Atomically increments the caller's fixed-window counter and, when allowed, appends an AI usage-log row |
+
+Introduced by migration 016 under [ADR-010](./adr/ADR-010-ai-rate-limiting-usage-metering.md). The `SECURITY DEFINER` function derives identity from `auth.uid()`; callers cannot consume quota for another user.
+
+---
+
 ## 6. Triggers
 
 ### `community_foods_classification_version` (BEFORE UPDATE)
@@ -818,8 +889,9 @@ This selective bump means unrelated field updates (e.g. incrementing `usage_coun
 | `community_food_aliases_usage_count_idx` | `community_food_aliases` | `(usage_count DESC)` | Popular alias ranking |
 | `community_food_moderation_history_food_idx` | `community_food_moderation_history` | `(community_food_id, created_at DESC)` | Moderation history lookups |
 | `food_subcategories_category_idx` | `food_subcategories` | `(food_category_id)` | |
+| `ai_usage_log_user_feature_idx` | `ai_usage_log` | `(user_id, feature, created_at)` | Per-user feature usage history and metering queries |
 
-All indexes above were confirmed present on both Development and Production as of the July 2026 reconciliation (Section 11); those missing from Production were recreated by migration 013 using `CREATE INDEX IF NOT EXISTS`.
+Indexes through migration 014 were confirmed during the July 2026 reconciliation (Section 11). Migration 016 and `ai_usage_log_user_feature_idx` are live on Development and Production as of September 2026.
 
 ---
 
@@ -842,6 +914,7 @@ All indexes above were confirmed present on both Development and Production as o
 | 013 | `013_reconcile_production_to_development.sql` | Post-v2.0 maintenance | Comprehensive, additive, idempotent reconciliation of all schema drift found by forensic audit: 10 missing tables, 16 missing `pantry`/`shopping_list_items` columns, 4 missing FKs, 13 missing indexes, 15 missing functions, 1 missing trigger, 3 renamed `pantry` RLS policies, plus seed/reference data. A no-op on Development |
 | 014 | `014_defensive_pantry_prerequisite_guard.sql` | Post-v2.0 maintenance | Forward-only hardening of migration 012: restates its four FK-bearing `pantry` columns so each is only added if its referenced table exists, instead of raising an error. Does not edit 012 |
 | 015 | `015_transactional_write_rpcs.sql` | ADR-009 Phase 1 | Adds six transactional write RPCs and the `pantry_user_canonical_stack_idx` partial unique index. Converts multi-request write sequences into atomic database operations |
+| 016 | `016_ai_usage_and_quota.sql` | ADR-010 | Creates `ai_usage_counters` and `ai_usage_log`, their RLS policies and metering index, and the atomic `check_and_consume_ai_quota` RPC |
 
 ---
 

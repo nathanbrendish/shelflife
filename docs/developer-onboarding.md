@@ -765,6 +765,7 @@ git branch
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Engineering standards and contribution process |
 | [docs/adr/](./adr/) | Architecture Decision Records |
 | [ADR-009: Transactional Write Patterns](./adr/ADR-009-transactional-write-patterns.md) | Atomic persistence rules for multi-step Server Actions |
+| [ADR-010: AI Rate-Limiting and Usage Metering](./adr/ADR-010-ai-rate-limiting-usage-metering.md) | Per-user AI rate-limiting and usage metering |
 | [docs/community-food-intelligence.md](./community-food-intelligence.md) | Community Food Intelligence deep-dive |
 
 ---
@@ -781,6 +782,7 @@ git branch
 - Use `insertOrStackPantryItem()` for single-item pantry writes (`addIngredient`); batch receipt saves go through the `save_scanned_items` RPC (ADR-009) — never insert into `pantry` directly outside these paths
 - Use `insertShoppingListRows()` for the additive "Add Missing" path; full regeneration goes through the `regenerate_shopping_list` RPC (ADR-009) — never insert into `shopping_list_items` directly outside these paths
 - Any Server Action performing more than one dependent write must persist through a transactional RPC (ADR-009), not sequential Supabase calls
+- Every Gemini call must follow a successful `consumeAiQuota(...)` check ([ADR-010](./adr/ADR-010-ai-rate-limiting-usage-metering.md)); never call an AI provider without it
 - Use `addMissingIngredientsToShoppingList()` via `MissingIngredientsSection` — never build custom Add Missing implementations
 - Add `IF NOT EXISTS` to every migration statement
 - Keep community learning non-blocking: wrap in try/catch, return empty cache on failure

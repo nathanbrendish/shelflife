@@ -1,6 +1,7 @@
 # ADR-010: AI Rate-Limiting and Usage Metering
 
 **Status:** Accepted
+**Deployed:** September 2026 (Development + Production)
 **Date:** September 2026
 **Deciders:** Chief Software Architect, Engineering lead
 **Repository Path:** `/src/app/api/scan-receipt/route.ts`, `/src/app/actions/planner.ts`, `/src/app/actions/meals.ts`, `/src/lib/gemini/`, `/supabase/migrations/` (new usage table + RPC)
