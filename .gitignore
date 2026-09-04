@@ -40,3 +40,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# generated document exports - the tracked .md sources under docs/ (and
+# CONTRIBUTING.md at the repo root) are the source of truth; PDF/DOCX copies
+# are local, generated convenience exports and are not version-controlled.
+docs/**/*.pdf
+docs/**/*.docx
+CONTRIBUTING.pdf
