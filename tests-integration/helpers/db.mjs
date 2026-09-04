@@ -10,6 +10,7 @@
 // `pg` connection, which is the standard way to exercise these functions
 // without needing the full Auth/PostgREST/Kong stack running.
 
+import { randomBytes } from "node:crypto";
 import pg from "pg";
 
 const { Client } = pg;
@@ -84,7 +85,14 @@ function placeholderForType(dataType) {
  */
 export async function createTestUser(client, { superAdmin = false } = {}) {
   userCounter += 1;
-  const email = `fault-injection-${Date.now()}-${userCounter}@example.test`;
+  // `node --test` runs multiple *.test.mjs files concurrently, each in its
+  // own module instance with its own independent `userCounter` starting at
+  // 0 — so `Date.now()-userCounter` alone can collide between two files
+  // calling this at the same millisecond with the same counter value (seen
+  // in practice once a second integration test file was added alongside
+  // fault-injection.test.mjs). The random suffix makes this collision-proof
+  // regardless of how many files/processes call this concurrently.
+  const email = `fault-injection-${Date.now()}-${userCounter}-${randomBytes(4).toString("hex")}@example.test`;
 
   const { rows: extraColumns } = await client.query(
     `SELECT column_name, data_type
