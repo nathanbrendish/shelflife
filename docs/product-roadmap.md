@@ -273,6 +273,7 @@
 | **RT-GAP:** RLS cross-user denial matrix, prompt-injection probe, FUP-2 partial-commit, BUG-05 conservation, and ADR-010 quota-exceeded behavior remain runtime-unverified | Verification debt — pending a capable test environment with a working shell, A/B/super-admin JWTs, and Gemini fault harness. Design and schema assurance are strong, but runtime closure remains open |
 | **F-2b:** AI free text enters prompts without explicit prompt-injection neutralization beyond JSON mode and response parse validation | Deferred-tracked security review — define mitigation and run a runtime prompt-injection probe |
 | **F-2a:** `withGeminiRetry()` retries 502/503/504, not provider 429 responses | Deferred-tracked low-resilience improvement — ADR-010 quota enforcement is the primary remedy; optional provider `Retry-After`/backoff support may be added later |
+| **AI usage maintenance (migration 017):** **N-3** — own-row SELECT policies on `ai_usage_counters` and `ai_usage_log` omit `TO authenticated` (harmless today but inconsistent with the ADR-009 norm); **N-5** — neither table has retention or pruning, so counters grow by user/feature/day and the log grows per allowed call | Deferred-tracked — bundle both into one reviewed migration 017 because migration 016 is immutable. Design N-5's pruning strategy (scheduled job or cleanup migration) when prioritised; see [ADR-010](./adr/ADR-010-ai-rate-limiting-usage-metering.md) |
 
 ---
 
